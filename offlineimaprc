@@ -1,0 +1,44 @@
+# password for mailbox is stored in ~/.netrc:
+#
+# machine imap.mailbox.org
+#     login <EMAIL>
+#     password <PASSWORD>
+#
+# don't forget to change file permissions:
+# chmod 600 ~/.netrc
+#
+# offlineimap does not support multiple users per host: https://github.com/OfflineIMAP/offlineimap/issues/295
+#
+
+[general]
+# List of accounts to be synced, separated by a comma.
+accounts = mailbox
+
+[Account mailbox]
+# Identifier for the local repository; e.g. the maildir to be synced via IMAP.
+localrepository = mailbox-local
+# Identifier for the remote repository; i.e. the actual IMAP, usually non-local.
+remoterepository = mailbox-remote
+# Status cache. Default is plain, which eventually becomes huge and slow.
+#status_backend = sqlite
+
+[Repository mailbox-local]
+# Currently, offlineimap only supports maildir and IMAP for local repositories.
+type = Maildir
+# Where should the mail be placed?
+localfolders = ~/Maildir
+
+[Repository mailbox-remote]
+# Remote repos can be IMAP or Gmail, the latter being a preconfigured IMAP.
+type = IMAP
+ssl = yes
+# CA certificate path is set by sync-mailbox.sh based on OS:
+# Linux: /etc/ssl/certs/ca-certificates.crt
+# macOS: /opt/homebrew/etc/ca-certificates/cert.pem
+sslcacertfile = /etc/ssl/certs/ca-certificates.crt
+remotehost = imap.mailbox.org
+# TODO: change to correct email address
+remoteuser = <EMAIL>
+readonly = true
+createfolders = false
+nametrans = lambda folder: "" if folder == "INBOX" else "." + re.sub('/', '.', folder)
