@@ -130,6 +130,55 @@ python3 imap_dedup.py --apply plan.json --permanent
 python3 imap_dedup.py --apply plan.json --imap-trash "Deleted Messages"
 ```
 
+### Clean hidden folders
+
+Some IMAP folders are synced by OfflineIMAP but invisible in Apple Mail — typically folders with `\Noselect` or `\NonExistent` attributes (stale hierarchy nodes, folders flagged for deletion but not yet purged). The `--clean-hidden` mode detects these folders, checks if their messages exist in normal folders, rescues orphans, and deletes the duplicated copies.
+
+**Preview (dry-run):**
+
+```bash
+python3 imap_dedup.py --clean-hidden --imap-host imap.mailbox.org --dry-run
+python3 imap_dedup.py --clean-hidden --imap-host imap.mailbox.org --dry-run -v  # per-message details
+```
+
+**Clean (copy orphans to "Recovered", delete from hidden folders):**
+
+```bash
+python3 imap_dedup.py --clean-hidden --imap-host imap.mailbox.org
+```
+
+**Custom rescue folder:**
+
+```bash
+python3 imap_dedup.py --clean-hidden --imap-host imap.mailbox.org --rescue-folder "Rescued"
+```
+
+**Also delete empty hidden folders after cleaning:**
+
+```bash
+python3 imap_dedup.py --clean-hidden --imap-host imap.mailbox.org --delete-folders
+```
+
+Safety: orphaned messages (only in hidden folders) are copied to the rescue folder before deletion. Message-IDs are re-verified before each delete. The `--dry-run` flag previews without changes.
+
+### Prune empty `\Noselect` hierarchy nodes
+
+`\Noselect` folders are hierarchy-only containers that hold subfolders but no messages. Some are stale leftovers. The `--prune-noselect` mode deletes `\Noselect` folders that contain no messages — even transitively (none of their descendants have messages either).
+
+**Preview:**
+
+```bash
+python3 imap_dedup.py --prune-noselect --imap-host imap.mailbox.org --dry-run
+```
+
+**Prune:**
+
+```bash
+python3 imap_dedup.py --prune-noselect --imap-host imap.mailbox.org
+```
+
+Folders are deleted deepest-first to respect IMAP hierarchy constraints.
+
 ## CLI reference
 
 ```
@@ -139,9 +188,13 @@ positional arguments:
 options:
   -e, --export FILE           Export dedup plan as JSON
   -a, --apply FILE            Apply plan via IMAP (deletes by default)
-  -d, --dry-run               Verify plan only, don't delete (requires --apply)
+  --clean-hidden              Detect and clean hidden IMAP folders (\Noselect/\NonExistent)
+  --prune-noselect            Delete empty \Noselect hierarchy nodes (no messages transitively)
+  -d, --dry-run               Preview without changes (for --apply, --clean-hidden, --prune-noselect)
   -p, --permanent             Permanently delete (EXPUNGE) instead of moving to Trash
-  -H, --imap-host HOST        IMAP server hostname (required for --export)
+  --delete-folders            Also delete empty hidden folders (requires --clean-hidden)
+  --rescue-folder FOLDER      Destination for orphaned messages (default: Recovered)
+  -H, --imap-host HOST        IMAP server hostname (required for --export, --clean-hidden, --prune-noselect)
   -T, --imap-trash FOLDER     Override Trash folder (auto-detected by default)
   -S, --sender IDENTITY       Sender identity (bag-of-words match against From header);
                               Sent folder priority only applies when From matches
@@ -165,8 +218,14 @@ options:
 | Apply: permanent delete | `--apply plan.json --permanent` |
 | Apply: custom Trash | `--apply plan.json --imap-trash "Deleted Messages"` |
 | Apply: one folder only | `--apply plan.json --folders FOLDER` |
+| Clean hidden (dry-run) | `--clean-hidden --imap-host HOST --dry-run` |
+| Clean hidden | `--clean-hidden --imap-host HOST` |
+| Clean hidden + delete folders | `--clean-hidden --imap-host HOST --delete-folders` |
+| Clean hidden + custom rescue | `--clean-hidden --imap-host HOST --rescue-folder "Rescued"` |
+| Prune noselect (dry-run) | `--prune-noselect --imap-host HOST --dry-run` |
+| Prune noselect | `--prune-noselect --imap-host HOST` |
 
-Mutually exclusive: `--export` / `--apply`, and `--interactive` / `--quiet` / `--apply`. The `--permanent` and `--dry-run` flags require `--apply`. The `--interactive` flag requires a TTY. Combining `--interactive` with `--export` lets you review duplicates before writing the plan.
+Mutually exclusive: `--export` / `--apply` / `--clean-hidden` / `--prune-noselect`, and `--interactive` / `--quiet` / `--apply`. The `--permanent` flag requires `--apply`. The `--dry-run` flag works with `--apply`, `--clean-hidden`, and `--prune-noselect`. The `--delete-folders` flag requires `--clean-hidden`. The `--interactive` flag requires a TTY. Combining `--interactive` with `--export` lets you review duplicates before writing the plan.
 
 ## How duplicate detection works
 

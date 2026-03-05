@@ -703,25 +703,492 @@ def imap_connect(host: str) -> imaplib.IMAP4_SSL:
     return conn
 
 
+def imap_parse_list_entry(item: bytes) -> tuple[set[bytes], str] | None:
+    """Parse one IMAP LIST response into (attributes_set, folder_name).
+
+    Expected format: (\\Flag1 \\Flag2) "delimiter" "folder_name"
+    Returns None if the entry cannot be parsed.
+    """
+    m = re.match(rb'\(([^)]*)\)\s+"([^"]*)"\s+"?([^"]*)"?', item)
+    if not m:
+        return None
+    flags_raw = m.group(1)
+    folder_name = m.group(3).decode("utf-8", errors="replace")
+    attributes = {f.strip() for f in flags_raw.split() if f.strip()}
+    return attributes, folder_name
+
+
+def imap_list_all_folders(conn: imaplib.IMAP4_SSL) -> list[tuple[str, set[bytes]]]:
+    """List all IMAP folders with their attributes.
+
+    Returns [(folder_name, attributes_set), ...].
+    """
+    typ, data = conn.list('', '*')
+    if typ != "OK":
+        return []
+    results = []
+    for item in data:
+        if not isinstance(item, bytes):
+            continue
+        parsed = imap_parse_list_entry(item)
+        if parsed:
+            attrs, name = parsed
+            results.append((name, attrs))
+    return results
+
+
 def imap_find_trash_folder(conn: imaplib.IMAP4_SSL) -> str:
     """Auto-detect the Trash folder via RFC 6154 \\Trash special-use attribute.
 
     Falls back to "Trash" if no folder with the attribute is found.
     """
-    typ, data = conn.list('', '*')
-    if typ == "OK":
-        for item in data:
-            if isinstance(item, bytes) and b"\\Trash" in item:
-                # LIST response format: (flags) delimiter "folder name"
-                # Extract the quoted folder name after the last space
-                m = re.search(rb'"([^"]*)"$', item)
-                if m:
-                    return m.group(1).decode("utf-8", errors="replace")
-                # Fallback: last space-separated token
-                parts = item.split()
-                if parts:
-                    return parts[-1].decode("utf-8", errors="replace").strip('"')
+    for name, attrs in imap_list_all_folders(conn):
+        if b"\\Trash" in attrs:
+            return name
     return "Trash"
+
+
+def imap_fetch_all_message_ids(
+    conn: imaplib.IMAP4_SSL,
+    folder: str,
+    quiet: bool = False,
+) -> dict[str, str] | None:
+    """Fetch all Message-IDs from a folder.
+
+    Selects folder readonly and fetches Message-ID headers in bulk.
+    Returns {normalized_message_id: uid_str}, or None if folder can't be selected.
+    """
+    typ, data = conn.select(imap_quote_folder(folder), readonly=True)
+    if typ != "OK":
+        return None
+
+    # Get message count
+    num_messages = int(data[0])
+    if num_messages == 0:
+        return {}
+
+    typ, data = conn.uid("SEARCH", None, "ALL")
+    if typ != "OK" or not data[0]:
+        return {}
+
+    uids = data[0].split()
+    uid_set = b",".join(uids).decode()
+
+    typ, data = conn.uid("FETCH", uid_set, "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+    if typ != "OK":
+        return {}
+
+    result: dict[str, str] = {}
+    hdr_parser = email.parser.BytesHeaderParser(policy=email.policy.compat32)
+
+    # FETCH responses come as tuples: (b'UID FLAGS...', b'header data')
+    i = 0
+    while i < len(data):
+        item = data[i]
+        if isinstance(item, tuple) and len(item) == 2:
+            # Parse UID from response
+            uid_match = re.search(rb"UID\s+(\d+)", item[0])
+            if uid_match:
+                uid_str = uid_match.group(1).decode()
+                raw_header = item[1]
+                if isinstance(raw_header, str):
+                    raw_header = raw_header.encode("utf-8", errors="replace")
+                parsed = hdr_parser.parsebytes(raw_header)
+                mid_value = parsed.get("Message-ID")
+                if mid_value:
+                    mid = normalize_message_id(mid_value)
+                    if mid:
+                        result[mid] = uid_str
+        i += 1
+
+    return result
+
+
+def imap_copy_messages(
+    conn: imaplib.IMAP4_SSL,
+    src_folder: str,
+    uids: list[str],
+    dest_folder: str,
+    quiet: bool = False,
+) -> int:
+    """Copy messages by UID from src_folder to dest_folder.
+
+    Returns count of successfully copied messages.
+    """
+    if not uids:
+        return 0
+
+    typ, _ = conn.select(imap_quote_folder(src_folder))
+    if typ != "OK":
+        if not quiet:
+            print(f"  WARNING: Cannot select {src_folder}", file=sys.stderr)
+        return 0
+
+    uid_set = ",".join(uids)
+    typ, _ = conn.uid("COPY", uid_set, imap_quote_folder(dest_folder))
+    if typ == "OK":
+        return len(uids)
+    if not quiet:
+        print(f"  WARNING: COPY failed from {src_folder} to {dest_folder}",
+              file=sys.stderr)
+    return 0
+
+
+def imap_delete_folder(
+    conn: imaplib.IMAP4_SSL,
+    folder: str,
+    quiet: bool = False,
+) -> bool:
+    """Delete an IMAP folder. Returns True on success."""
+    typ, _ = conn.delete(imap_quote_folder(folder))
+    if typ == "OK":
+        return True
+    if not quiet:
+        print(f"  WARNING: Cannot delete folder {folder}", file=sys.stderr)
+    return False
+
+
+def imap_folder_message_count(
+    conn: imaplib.IMAP4_SSL,
+    folder: str,
+) -> int:
+    """Return the number of messages in a folder, or 0 if it can't be selected."""
+    typ, data = conn.select(imap_quote_folder(folder), readonly=True)
+    if typ != "OK":
+        return 0
+    return int(data[0])
+
+
+def clean_hidden_folders(
+    imap_host: str,
+    dry_run: bool = False,
+    rescue_folder: str = "Recovered",
+    delete_folders: bool = False,
+    verbose: bool = False,
+    quiet: bool = False,
+) -> int:
+    """Detect hidden IMAP folders and clean up their messages.
+
+    Hidden folders are those with \\Noselect or \\NonExistent attributes.
+    Duplicated messages (also in normal folders) are deleted; orphaned messages
+    are copied to a rescue folder first.
+
+    Returns exit code: 0 on success, 1 on error.
+    """
+    if not quiet:
+        print("Clean hidden folders")
+        print(f"Host: {imap_host}")
+        print()
+
+    conn = imap_connect(imap_host)
+
+    try:
+        # 1. List all folders with attributes
+        all_folders = imap_list_all_folders(conn)
+        if not all_folders:
+            if not quiet:
+                print("No folders found.")
+            return 0
+
+        # 2. Classify: hidden vs normal
+        hidden_attrs = {b"\\Noselect", b"\\NonExistent"}
+        hidden_folders = []
+        normal_folders = []
+        for name, attrs in all_folders:
+            if attrs & hidden_attrs:
+                hidden_folders.append((name, attrs))
+            else:
+                normal_folders.append((name, attrs))
+
+        if not hidden_folders:
+            if not quiet:
+                print("No hidden folders found.")
+            return 0
+
+        if not quiet:
+            print(f"Found {len(hidden_folders)} hidden folder(s):")
+            for name, attrs in hidden_folders:
+                attr_str = " ".join(a.decode("utf-8", errors="replace") for a in sorted(attrs))
+                print(f"  {name}  [{attr_str}]")
+            print()
+
+        # 3. Fetch Message-IDs from hidden folders
+        hidden_messages: dict[str, dict[str, str]] = {}  # folder -> {mid: uid}
+        for name, _ in hidden_folders:
+            mids = imap_fetch_all_message_ids(conn, name, quiet=quiet)
+            if mids is None:
+                if not quiet:
+                    print(f"  {name}: cannot select (truly non-existent), skipping")
+                continue
+            hidden_messages[name] = mids
+            if not quiet:
+                print(f"  {name}: {len(mids)} message(s)")
+
+        total_hidden_msgs = sum(len(m) for m in hidden_messages.values())
+        if total_hidden_msgs == 0:
+            if not quiet:
+                print("\nNo messages in hidden folders.")
+            if delete_folders and not dry_run:
+                for name, _ in hidden_folders:
+                    if name in hidden_messages:
+                        if imap_delete_folder(conn, name, quiet=quiet):
+                            if not quiet:
+                                print(f"  Deleted empty folder: {name}")
+            return 0
+
+        # 4. Fetch Message-IDs from all normal folders
+        if not quiet:
+            print(f"\nScanning {len(normal_folders)} normal folder(s)...")
+
+        normal_message_ids: set[str] = set()
+        for name, _ in normal_folders:
+            mids = imap_fetch_all_message_ids(conn, name, quiet=quiet)
+            if mids is not None:
+                normal_message_ids.update(mids.keys())
+                if verbose:
+                    print(f"  {name}: {len(mids)} message(s)")
+
+        if not quiet:
+            print(f"  Total unique Message-IDs in normal folders: {len(normal_message_ids)}")
+
+        # 5. Cross-reference: classify hidden messages
+        total_duplicated = 0
+        total_orphaned = 0
+        folder_report: dict[str, tuple[list[tuple[str, str]], list[tuple[str, str]]]] = {}
+
+        for folder, mids in hidden_messages.items():
+            duplicated = []  # [(mid, uid), ...]
+            orphaned = []    # [(mid, uid), ...]
+            for mid, uid in mids.items():
+                if mid in normal_message_ids:
+                    duplicated.append((mid, uid))
+                else:
+                    orphaned.append((mid, uid))
+            folder_report[folder] = (duplicated, orphaned)
+            total_duplicated += len(duplicated)
+            total_orphaned += len(orphaned)
+
+        # 6. Safety report
+        if not quiet:
+            print(f"\n{'=' * 60}")
+            print(f"Safety report")
+            print(f"{'=' * 60}")
+            for folder, (duplicated, orphaned) in sorted(folder_report.items()):
+                print(f"  {folder}:")
+                print(f"    Duplicated (safe to delete): {len(duplicated)}")
+                print(f"    Orphaned (will rescue):      {len(orphaned)}")
+                if verbose:
+                    for mid, uid in orphaned:
+                        print(f"      UID {uid}: {mid}")
+            print(f"\n  Total duplicated: {total_duplicated}")
+            print(f"  Total orphaned:   {total_orphaned}")
+
+        if dry_run:
+            if not quiet:
+                print(f"\nDry run — no changes made.")
+            return 0
+
+        # 7. Copy orphaned messages to rescue folder
+        if total_orphaned > 0:
+            # Create rescue folder if needed
+            conn.create(imap_quote_folder(rescue_folder))  # OK if already exists
+            if not quiet:
+                print(f"\nCopying {total_orphaned} orphaned message(s) to {rescue_folder}...")
+
+            copied = 0
+            for folder, (_, orphaned) in sorted(folder_report.items()):
+                if not orphaned:
+                    continue
+                orphan_uids = [uid for _, uid in orphaned]
+                n = imap_copy_messages(conn, folder, orphan_uids, rescue_folder, quiet=quiet)
+                copied += n
+                if not quiet:
+                    print(f"  {folder}: copied {n}/{len(orphan_uids)} orphan(s)")
+
+            if copied < total_orphaned:
+                print(f"ERROR: Only copied {copied}/{total_orphaned} orphans. "
+                      f"Aborting to prevent data loss.", file=sys.stderr)
+                return 1
+
+        # 8. Delete all messages from hidden folders
+        if not quiet:
+            print(f"\nDeleting messages from hidden folders...")
+
+        total_deleted = 0
+        for folder, (duplicated, orphaned) in sorted(folder_report.items()):
+            all_uids = [uid for _, uid in duplicated] + [uid for _, uid in orphaned]
+            if not all_uids:
+                continue
+
+            # Re-verify Message-IDs before deletion
+            current_mids = imap_fetch_all_message_ids(conn, folder, quiet=quiet)
+            if current_mids is None:
+                if not quiet:
+                    print(f"  {folder}: cannot re-select, skipping deletion")
+                continue
+
+            verified_uids = []
+            for mid, uid in duplicated + orphaned:
+                if current_mids.get(mid) == uid:
+                    verified_uids.append(uid)
+                elif verbose:
+                    print(f"  {folder}: UID {uid} changed, skipping")
+
+            if not verified_uids:
+                continue
+
+            typ, _ = conn.select(imap_quote_folder(folder))
+            if typ != "OK":
+                continue
+
+            uid_set = ",".join(verified_uids)
+            typ, _ = conn.uid("STORE", uid_set, "+FLAGS", "(\\Deleted)")
+            if typ == "OK":
+                conn.expunge()
+                total_deleted += len(verified_uids)
+                if not quiet:
+                    print(f"  {folder}: deleted {len(verified_uids)} message(s)")
+
+        # 9. Delete empty hidden folders if requested
+        folders_deleted = 0
+        if delete_folders:
+            if not quiet:
+                print(f"\nDeleting empty hidden folders...")
+            for name, _ in hidden_folders:
+                if name not in hidden_messages:
+                    continue
+                count = imap_folder_message_count(conn, name)
+                if count == 0:
+                    if imap_delete_folder(conn, name, quiet=quiet):
+                        folders_deleted += 1
+                        if not quiet:
+                            print(f"  Deleted: {name}")
+                elif not quiet:
+                    print(f"  {name}: still has {count} message(s), skipping")
+
+        # 10. Summary
+        if not quiet:
+            print(f"\n{'=' * 60}")
+            print(f"Summary")
+            print(f"{'=' * 60}")
+            print(f"  Messages deleted: {total_deleted}")
+            if total_orphaned > 0:
+                print(f"  Orphans rescued to {rescue_folder}: {total_orphaned}")
+            if delete_folders:
+                print(f"  Folders deleted: {folders_deleted}")
+
+    finally:
+        try:
+            conn.logout()
+        except (imaplib.IMAP4.error, OSError):
+            pass
+
+    return 0
+
+
+def prune_noselect_folders(
+    imap_host: str,
+    dry_run: bool = False,
+    verbose: bool = False,
+    quiet: bool = False,
+) -> int:
+    """Delete \\Noselect hierarchy nodes that contain no messages transitively.
+
+    Returns exit code: 0 on success, 1 on error.
+    """
+    if not quiet:
+        print("Prune empty \\Noselect folders")
+        print(f"Host: {imap_host}")
+        print()
+
+    conn = imap_connect(imap_host)
+
+    try:
+        all_folders = imap_list_all_folders(conn)
+        if not all_folders:
+            if not quiet:
+                print("No folders found.")
+            return 0
+
+        # Find \Noselect folders
+        noselect_folders = [(name, attrs) for name, attrs in all_folders
+                            if b"\\Noselect" in attrs]
+
+        if not noselect_folders:
+            if not quiet:
+                print("No \\Noselect folders found.")
+            return 0
+
+        if not quiet:
+            print(f"Found {len(noselect_folders)} \\Noselect folder(s):")
+            for name, _ in noselect_folders:
+                print(f"  {name}")
+            print()
+
+        # Build list of all folder names for descendant checks
+        all_folder_names = [(name, attrs) for name, attrs in all_folders]
+
+        # Check each \Noselect folder for messages (direct + transitive)
+        prunable = []
+        for ns_name, ns_attrs in noselect_folders:
+            # Check direct messages
+            direct_count = imap_folder_message_count(conn, ns_name)
+
+            # Find descendants (folders starting with ns_name + delimiter)
+            # Common delimiters: "/" and "."
+            descendant_total = 0
+            has_descendants = False
+            for fname, fattrs in all_folder_names:
+                if fname != ns_name and (fname.startswith(ns_name + "/") or
+                                          fname.startswith(ns_name + ".")):
+                    has_descendants = True
+                    count = imap_folder_message_count(conn, fname)
+                    descendant_total += count
+                    if verbose:
+                        print(f"  {fname}: {count} message(s)")
+
+            total = direct_count + descendant_total
+            if total == 0:
+                prunable.append(ns_name)
+                if not quiet:
+                    desc = f" ({descendant_total} in descendants)" if has_descendants else ""
+                    print(f"  Prunable: {ns_name}{desc}")
+            elif not quiet:
+                print(f"  Keeping:  {ns_name} ({total} messages)")
+
+        if not prunable:
+            if not quiet:
+                print("\nNo \\Noselect folders to prune.")
+            return 0
+
+        if not quiet:
+            print(f"\n{len(prunable)} folder(s) to prune.")
+
+        if dry_run:
+            if not quiet:
+                print("Dry run — no changes made.")
+            return 0
+
+        # Delete in reverse-depth order (deepest first)
+        prunable.sort(key=lambda n: n.count("/") + n.count("."), reverse=True)
+
+        deleted = 0
+        for name in prunable:
+            if imap_delete_folder(conn, name, quiet=quiet):
+                deleted += 1
+                if not quiet:
+                    print(f"  Deleted: {name}")
+
+        if not quiet:
+            print(f"\nDeleted {deleted}/{len(prunable)} folder(s).")
+
+    finally:
+        try:
+            conn.logout()
+        except (imaplib.IMAP4.error, OSError):
+            pass
+
+    return 0
 
 
 def imap_verify_and_delete(
@@ -1066,6 +1533,10 @@ def build_parser() -> argparse.ArgumentParser:
             "  %(prog)s --apply plan.json --dry-run                       Verify plan (dry-run)\n"
             "  %(prog)s --apply plan.json                                 Apply: move to Trash\n"
             "  %(prog)s --apply plan.json --permanent                     Apply: permanent delete\n"
+            "  %(prog)s --clean-hidden --imap-host HOST --dry-run         Report hidden folders\n"
+            "  %(prog)s --clean-hidden --imap-host HOST                   Clean hidden folders\n"
+            "  %(prog)s --prune-noselect --imap-host HOST --dry-run       Report empty \\Noselect folders\n"
+            "  %(prog)s --prune-noselect --imap-host HOST                 Prune empty \\Noselect folders\n"
         ),
     )
     parser.add_argument(
@@ -1119,10 +1590,31 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="Apply plan via IMAP (deletes duplicates; use -d for dry-run)",
     )
+    mode.add_argument(
+        "--clean-hidden",
+        action="store_true",
+        help="Detect and clean hidden IMAP folders (\\Noselect/\\NonExistent)",
+    )
+    mode.add_argument(
+        "--prune-noselect",
+        action="store_true",
+        help="Delete empty \\Noselect hierarchy nodes (no messages transitively)",
+    )
     parser.add_argument(
         "-d", "--dry-run",
         action="store_true",
-        help="Verify plan against IMAP without deleting (requires --apply)",
+        help="Preview without making changes (for --apply, --clean-hidden, --prune-noselect)",
+    )
+    parser.add_argument(
+        "--delete-folders",
+        action="store_true",
+        help="Also delete empty hidden folders after cleaning (requires --clean-hidden)",
+    )
+    parser.add_argument(
+        "--rescue-folder",
+        metavar="FOLDER",
+        default="Recovered",
+        help="Destination folder for orphaned messages (default: Recovered)",
     )
     parser.add_argument(
         "-i", "--interactive",
@@ -1155,12 +1647,22 @@ def main() -> int:
     args = parser.parse_args()
 
     # --- Validation ---
-    if args.dry_run and not args.apply:
-        print("ERROR: --dry-run requires --apply", file=sys.stderr)
+    if args.dry_run and not (args.apply or args.clean_hidden or args.prune_noselect):
+        print("ERROR: --dry-run requires --apply, --clean-hidden, or --prune-noselect",
+              file=sys.stderr)
         return 1
 
     if args.permanent and not args.apply:
         print("ERROR: --permanent requires --apply", file=sys.stderr)
+        return 1
+
+    if args.delete_folders and not args.clean_hidden:
+        print("ERROR: --delete-folders requires --clean-hidden", file=sys.stderr)
+        return 1
+
+    if (args.clean_hidden or args.prune_noselect) and not args.imap_host:
+        mode_name = "--clean-hidden" if args.clean_hidden else "--prune-noselect"
+        print(f"ERROR: {mode_name} requires --imap-host", file=sys.stderr)
         return 1
 
     if args.interactive:
@@ -1176,6 +1678,26 @@ def main() -> int:
             print("ERROR: --interactive requires a terminal (TTY)",
                   file=sys.stderr)
             return 1
+
+    # --- Clean hidden folders mode ---
+    if args.clean_hidden:
+        return clean_hidden_folders(
+            imap_host=args.imap_host,
+            dry_run=args.dry_run,
+            rescue_folder=args.rescue_folder,
+            delete_folders=args.delete_folders,
+            verbose=args.verbose,
+            quiet=args.quiet,
+        )
+
+    # --- Prune noselect mode ---
+    if args.prune_noselect:
+        return prune_noselect_folders(
+            imap_host=args.imap_host,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            quiet=args.quiet,
+        )
 
     # --- Apply mode: no local scan needed ---
     if args.apply:

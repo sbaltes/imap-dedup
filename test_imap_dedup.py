@@ -1779,3 +1779,467 @@ class TestInteractiveCLIValidation:
         with patch("sys.argv", ["prog", str(root), "-i"]):
             rc = imap_dedup.main()
         assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# imap_parse_list_entry
+# ---------------------------------------------------------------------------
+
+
+class TestImapParseListEntry:
+    def test_basic_entry(self):
+        item = b'(\\HasNoChildren) "/" "INBOX"'
+        result = imap_dedup.imap_parse_list_entry(item)
+        assert result is not None
+        attrs, name = result
+        assert b"\\HasNoChildren" in attrs
+        assert name == "INBOX"
+
+    def test_noselect_entry(self):
+        item = b'(\\Noselect \\HasChildren) "/" "Archive"'
+        result = imap_dedup.imap_parse_list_entry(item)
+        assert result is not None
+        attrs, name = result
+        assert b"\\Noselect" in attrs
+        assert b"\\HasChildren" in attrs
+        assert name == "Archive"
+
+    def test_multiple_flags(self):
+        item = b'(\\Trash \\HasNoChildren) "/" "Trash"'
+        result = imap_dedup.imap_parse_list_entry(item)
+        assert result is not None
+        attrs, name = result
+        assert b"\\Trash" in attrs
+        assert name == "Trash"
+
+    def test_folder_with_slash(self):
+        item = b'(\\HasNoChildren) "/" "Work/Projects"'
+        result = imap_dedup.imap_parse_list_entry(item)
+        assert result is not None
+        _, name = result
+        assert name == "Work/Projects"
+
+    def test_empty_flags(self):
+        item = b'() "/" "SomeFolder"'
+        result = imap_dedup.imap_parse_list_entry(item)
+        assert result is not None
+        attrs, name = result
+        assert attrs == {b""}  or attrs == set()  # empty set after filtering
+        assert name == "SomeFolder"
+
+    def test_unparseable(self):
+        result = imap_dedup.imap_parse_list_entry(b"garbage data")
+        assert result is None
+
+    def test_nonexistent_flag(self):
+        item = b'(\\NonExistent) "/" "OldFolder"'
+        result = imap_dedup.imap_parse_list_entry(item)
+        assert result is not None
+        attrs, name = result
+        assert b"\\NonExistent" in attrs
+        assert name == "OldFolder"
+
+
+# ---------------------------------------------------------------------------
+# imap_list_all_folders
+# ---------------------------------------------------------------------------
+
+
+class TestImapListAllFolders:
+    def test_basic_listing(self):
+        conn = MagicMock()
+        conn.list.return_value = ("OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\Noselect) "/" "Archive"',
+            b'(\\Trash) "/" "Trash"',
+        ])
+        result = imap_dedup.imap_list_all_folders(conn)
+        assert len(result) == 3
+        names = [name for name, _ in result]
+        assert "INBOX" in names
+        assert "Archive" in names
+        assert "Trash" in names
+
+    def test_empty_listing(self):
+        conn = MagicMock()
+        conn.list.return_value = ("OK", [])
+        result = imap_dedup.imap_list_all_folders(conn)
+        assert result == []
+
+    def test_failed_list(self):
+        conn = MagicMock()
+        conn.list.return_value = ("NO", [])
+        result = imap_dedup.imap_list_all_folders(conn)
+        assert result == []
+
+    def test_skips_non_bytes(self):
+        conn = MagicMock()
+        conn.list.return_value = ("OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            42,  # non-bytes entry
+        ])
+        result = imap_dedup.imap_list_all_folders(conn)
+        assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# imap_find_trash_folder (refactored)
+# ---------------------------------------------------------------------------
+
+
+class TestImapFindTrashFolderRefactored:
+    def test_finds_trash_by_attribute(self):
+        conn = MagicMock()
+        conn.list.return_value = ("OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\Trash) "/" "Deleted Items"',
+        ])
+        assert imap_dedup.imap_find_trash_folder(conn) == "Deleted Items"
+
+    def test_fallback_to_trash(self):
+        conn = MagicMock()
+        conn.list.return_value = ("OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+        ])
+        assert imap_dedup.imap_find_trash_folder(conn) == "Trash"
+
+
+# ---------------------------------------------------------------------------
+# imap_fetch_all_message_ids
+# ---------------------------------------------------------------------------
+
+
+class TestImapFetchAllMessageIds:
+    def test_fetches_message_ids(self):
+        conn = MagicMock()
+        conn.select.return_value = ("OK", [b"2"])
+        conn.uid.side_effect = [
+            # SEARCH ALL
+            ("OK", [b"1 2"]),
+            # FETCH
+            ("OK", [
+                (b"1 (UID 1 BODY[HEADER.FIELDS (MESSAGE-ID)] {30}",
+                 b"Message-ID: <abc@example.com>\r\n\r\n"),
+                b")",
+                (b"2 (UID 2 BODY[HEADER.FIELDS (MESSAGE-ID)] {30}",
+                 b"Message-ID: <def@example.com>\r\n\r\n"),
+                b")",
+            ]),
+        ]
+        result = imap_dedup.imap_fetch_all_message_ids(conn, "INBOX")
+        assert result is not None
+        assert "abc@example.com" in result
+        assert "def@example.com" in result
+        assert result["abc@example.com"] == "1"
+        assert result["def@example.com"] == "2"
+
+    def test_returns_none_on_select_failure(self):
+        conn = MagicMock()
+        conn.select.return_value = ("NO", [b"Folder not found"])
+        result = imap_dedup.imap_fetch_all_message_ids(conn, "NonExistent")
+        assert result is None
+
+    def test_empty_folder(self):
+        conn = MagicMock()
+        conn.select.return_value = ("OK", [b"0"])
+        result = imap_dedup.imap_fetch_all_message_ids(conn, "Empty")
+        assert result == {}
+
+    def test_search_returns_empty(self):
+        conn = MagicMock()
+        conn.select.return_value = ("OK", [b"1"])
+        conn.uid.return_value = ("OK", [b""])
+        result = imap_dedup.imap_fetch_all_message_ids(conn, "INBOX")
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# imap_copy_messages
+# ---------------------------------------------------------------------------
+
+
+class TestImapCopyMessages:
+    def test_successful_copy(self):
+        conn = MagicMock()
+        conn.select.return_value = ("OK", [b"5"])
+        conn.uid.return_value = ("OK", [b"OK"])
+        result = imap_dedup.imap_copy_messages(conn, "Source", ["1", "2"], "Dest")
+        assert result == 2
+        conn.uid.assert_called_once_with("COPY", "1,2", '"Dest"')
+
+    def test_empty_uids(self):
+        conn = MagicMock()
+        result = imap_dedup.imap_copy_messages(conn, "Source", [], "Dest")
+        assert result == 0
+        conn.select.assert_not_called()
+
+    def test_select_failure(self):
+        conn = MagicMock()
+        conn.select.return_value = ("NO", [b"Error"])
+        result = imap_dedup.imap_copy_messages(conn, "Source", ["1"], "Dest")
+        assert result == 0
+
+    def test_copy_failure(self):
+        conn = MagicMock()
+        conn.select.return_value = ("OK", [b"5"])
+        conn.uid.return_value = ("NO", [b"Error"])
+        result = imap_dedup.imap_copy_messages(conn, "Source", ["1"], "Dest")
+        assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# imap_delete_folder
+# ---------------------------------------------------------------------------
+
+
+class TestImapDeleteFolder:
+    def test_successful_delete(self):
+        conn = MagicMock()
+        conn.delete.return_value = ("OK", [b"Done"])
+        assert imap_dedup.imap_delete_folder(conn, "OldFolder") is True
+
+    def test_failed_delete(self):
+        conn = MagicMock()
+        conn.delete.return_value = ("NO", [b"Error"])
+        assert imap_dedup.imap_delete_folder(conn, "OldFolder") is False
+
+
+# ---------------------------------------------------------------------------
+# imap_folder_message_count
+# ---------------------------------------------------------------------------
+
+
+class TestImapFolderMessageCount:
+    def test_returns_count(self):
+        conn = MagicMock()
+        conn.select.return_value = ("OK", [b"42"])
+        assert imap_dedup.imap_folder_message_count(conn, "INBOX") == 42
+
+    def test_returns_zero_on_failure(self):
+        conn = MagicMock()
+        conn.select.return_value = ("NO", [b"Error"])
+        assert imap_dedup.imap_folder_message_count(conn, "Bad") == 0
+
+
+# ---------------------------------------------------------------------------
+# clean_hidden_folders (orchestrator)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanHiddenFolders:
+    def _mock_conn(self):
+        conn = MagicMock()
+        conn.list.return_value = ("OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\Noselect) "/" "HiddenFolder"',
+            b'(\\HasNoChildren) "/" "Sent"',
+        ])
+        return conn
+
+    @patch("imap_dedup.imap_connect")
+    def test_no_hidden_folders(self, mock_connect):
+        conn = MagicMock()
+        conn.list.return_value = ("OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+        ])
+        mock_connect.return_value = conn
+        rc = imap_dedup.clean_hidden_folders("host", quiet=True)
+        assert rc == 0
+
+    @patch("imap_dedup.imap_connect")
+    def test_dry_run_reports_only(self, mock_connect):
+        conn = self._mock_conn()
+        mock_connect.return_value = conn
+
+        # Hidden folder has 1 message, also in INBOX (duplicated)
+        def mock_select(folder, readonly=False):
+            return ("OK", [b"1"])
+
+        conn.select.side_effect = mock_select
+
+        # Mock fetches: hidden has msg, INBOX has same msg, Sent has nothing
+        call_count = [0]
+        def mock_uid(*args):
+            call_count[0] += 1
+            if args[0] == "SEARCH":
+                return ("OK", [b"1"])
+            if args[0] == "FETCH":
+                return ("OK", [
+                    (b"1 (UID 1 BODY[HEADER.FIELDS (MESSAGE-ID)] {30}",
+                     b"Message-ID: <dup@example.com>\r\n\r\n"),
+                    b")",
+                ])
+            return ("OK", [])
+
+        conn.uid.side_effect = mock_uid
+
+        rc = imap_dedup.clean_hidden_folders("host", dry_run=True, quiet=True)
+        assert rc == 0
+        # Should not have called STORE or expunge
+        for call in conn.uid.call_args_list:
+            assert call[0][0] != "STORE"
+
+    @patch("imap_dedup.imap_connect")
+    def test_empty_hidden_folder_no_messages(self, mock_connect):
+        conn = self._mock_conn()
+        mock_connect.return_value = conn
+
+        def mock_select(folder, readonly=False):
+            if "Hidden" in folder:
+                return ("OK", [b"0"])
+            return ("OK", [b"0"])
+
+        conn.select.side_effect = mock_select
+        rc = imap_dedup.clean_hidden_folders("host", quiet=True)
+        assert rc == 0
+
+    @patch("imap_dedup.imap_connect")
+    def test_clean_hidden_requires_imap_host_via_cli(self, mock_connect):
+        with patch("sys.argv", ["prog", "--clean-hidden"]):
+            rc = imap_dedup.main()
+        assert rc == 1
+
+    @patch("imap_dedup.imap_connect")
+    def test_delete_folders_requires_clean_hidden(self, mock_connect):
+        with patch("sys.argv", ["prog", "--delete-folders"]):
+            rc = imap_dedup.main()
+        assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# prune_noselect_folders (orchestrator)
+# ---------------------------------------------------------------------------
+
+
+class TestPruneNoselectFolders:
+    @patch("imap_dedup.imap_connect")
+    def test_no_noselect_folders(self, mock_connect):
+        conn = MagicMock()
+        conn.list.return_value = ("OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+        ])
+        mock_connect.return_value = conn
+        rc = imap_dedup.prune_noselect_folders("host", quiet=True)
+        assert rc == 0
+
+    @patch("imap_dedup.imap_connect")
+    def test_dry_run_does_not_delete(self, mock_connect):
+        conn = MagicMock()
+        conn.list.return_value = ("OK", [
+            b'(\\Noselect) "/" "EmptyParent"',
+            b'(\\HasNoChildren) "/" "INBOX"',
+        ])
+        conn.select.return_value = ("OK", [b"0"])
+        mock_connect.return_value = conn
+
+        rc = imap_dedup.prune_noselect_folders("host", dry_run=True, quiet=True)
+        assert rc == 0
+        conn.delete.assert_not_called()
+
+    @patch("imap_dedup.imap_connect")
+    def test_prunes_empty_noselect(self, mock_connect):
+        conn = MagicMock()
+        conn.list.return_value = ("OK", [
+            b'(\\Noselect) "/" "EmptyParent"',
+            b'(\\HasNoChildren) "/" "INBOX"',
+        ])
+        conn.select.return_value = ("OK", [b"0"])
+        conn.delete.return_value = ("OK", [b"Done"])
+        mock_connect.return_value = conn
+
+        rc = imap_dedup.prune_noselect_folders("host", quiet=True)
+        assert rc == 0
+        conn.delete.assert_called_once()
+
+    @patch("imap_dedup.imap_connect")
+    def test_keeps_noselect_with_descendant_messages(self, mock_connect):
+        conn = MagicMock()
+        conn.list.return_value = ("OK", [
+            b'(\\Noselect) "/" "Parent"',
+            b'(\\HasNoChildren) "/" "Parent/Child"',
+            b'(\\HasNoChildren) "/" "INBOX"',
+        ])
+
+        def mock_select(folder, readonly=False):
+            if "Child" in folder:
+                return ("OK", [b"5"])
+            return ("OK", [b"0"])
+
+        conn.select.side_effect = mock_select
+        mock_connect.return_value = conn
+
+        rc = imap_dedup.prune_noselect_folders("host", quiet=True)
+        assert rc == 0
+        conn.delete.assert_not_called()
+
+    @patch("imap_dedup.imap_connect")
+    def test_deletes_deepest_first(self, mock_connect):
+        conn = MagicMock()
+        conn.list.return_value = ("OK", [
+            b'(\\Noselect) "/" "A"',
+            b'(\\Noselect) "/" "A/B"',
+            b'(\\HasNoChildren) "/" "INBOX"',
+        ])
+        conn.select.return_value = ("OK", [b"0"])
+        conn.delete.return_value = ("OK", [b"Done"])
+        mock_connect.return_value = conn
+
+        rc = imap_dedup.prune_noselect_folders("host", quiet=True)
+        assert rc == 0
+        # A/B should be deleted before A
+        delete_calls = conn.delete.call_args_list
+        assert len(delete_calls) == 2
+        assert "A/B" in delete_calls[0][0][0]
+        assert delete_calls[1][0][0] == '"A"'
+
+    @patch("imap_dedup.imap_connect")
+    def test_prune_noselect_requires_imap_host_via_cli(self, mock_connect):
+        with patch("sys.argv", ["prog", "--prune-noselect"]):
+            rc = imap_dedup.main()
+        assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# CLI validation for new modes
+# ---------------------------------------------------------------------------
+
+
+class TestNewModeCLIValidation:
+    def test_dry_run_with_clean_hidden_is_valid(self):
+        """--dry-run should be accepted with --clean-hidden."""
+        with patch("sys.argv", ["prog", "--clean-hidden", "--imap-host", "host", "--dry-run"]), \
+             patch("imap_dedup.clean_hidden_folders", return_value=0) as mock_fn:
+            rc = imap_dedup.main()
+        assert rc == 0
+        mock_fn.assert_called_once()
+        assert mock_fn.call_args[1]["dry_run"] is True
+
+    def test_dry_run_with_prune_noselect_is_valid(self):
+        """--dry-run should be accepted with --prune-noselect."""
+        with patch("sys.argv", ["prog", "--prune-noselect", "--imap-host", "host", "--dry-run"]), \
+             patch("imap_dedup.prune_noselect_folders", return_value=0) as mock_fn:
+            rc = imap_dedup.main()
+        assert rc == 0
+        mock_fn.assert_called_once()
+        assert mock_fn.call_args[1]["dry_run"] is True
+
+    def test_rescue_folder_passed_to_clean_hidden(self):
+        with patch("sys.argv", ["prog", "--clean-hidden", "--imap-host", "host",
+                                 "--rescue-folder", "Rescued"]), \
+             patch("imap_dedup.clean_hidden_folders", return_value=0) as mock_fn:
+            rc = imap_dedup.main()
+        assert rc == 0
+        assert mock_fn.call_args[1]["rescue_folder"] == "Rescued"
+
+    def test_delete_folders_passed_to_clean_hidden(self):
+        with patch("sys.argv", ["prog", "--clean-hidden", "--imap-host", "host",
+                                 "--delete-folders"]), \
+             patch("imap_dedup.clean_hidden_folders", return_value=0) as mock_fn:
+            rc = imap_dedup.main()
+        assert rc == 0
+        assert mock_fn.call_args[1]["delete_folders"] is True
+
+    def test_dry_run_alone_fails(self):
+        with patch("sys.argv", ["prog", "--dry-run"]):
+            rc = imap_dedup.main()
+        assert rc == 1
