@@ -66,48 +66,65 @@ Run the included sync script:
 
 This detects the correct CA certificate path for your OS (macOS/Linux), updates `~/.offlineimaprc` accordingly, and runs `offlineimap`. Output is logged to `~/log_sync-mailbox.log`.
 
-## Usage
+## Recommended workflow
 
-### Scan for duplicates
+**Before you start:**
+
+- `~/.netrc` is configured with IMAP credentials for your server (see [Setting up `~/.netrc`](#setting-up-netrc))
+- `~/.offlineimaprc` is configured (see [Configuring OfflineIMAP](#configuring-offlineimap))
+- The `--imap-host` flag uses `~/.netrc` to look up the username and password by hostname — no separate user flag is needed
+
+**Steps:**
+
+**1. Sync mailbox**
 
 ```bash
-python3 imap_dedup.py ~/Maildir
-python3 imap_dedup.py ~/Maildir --verbose    # verbose: show every duplicate group
-python3 imap_dedup.py ~/Maildir --sender "Sebastian Baltes"  # Sent priority only for your own emails
-```
-
-### Export + apply workflow
-
-```bash
-# 1. Scan local Maildir and export a deletion plan
-python3 imap_dedup.py ~/Maildir --export plan.json --imap-host imap.mailbox.org
-
-# 2. Verify the plan against the live IMAP server (dry-run)
-python3 imap_dedup.py --apply plan.json --dry-run
-
-# 3. Apply: move duplicates to Trash (default)
-python3 imap_dedup.py --apply plan.json
-
-# 4. Or: permanently delete (EXPUNGE)
-python3 imap_dedup.py --apply plan.json --permanent
-
-# 5. Re-sync to update local Maildir
 ./sync-mailbox.sh
 ```
 
-### Interactive review
-
-Review duplicates folder-by-folder before exporting:
+**2. Interactive review & export plan**
 
 ```bash
-python3 imap_dedup.py ~/Maildir --interactive --export plan.json --imap-host imap.mailbox.org
+python3 imap_dedup.py ~/Maildir --interactive --export plan.json --imap-host imap.mailbox.org --sender "Your Name"
 ```
 
-For each folder you can accept all, skip all, or review one-by-one.
+- `--sender` ensures Sent folder priority only applies to your own emails
+- `--interactive` lets you review duplicates folder-by-folder before committing to the plan
 
-### Custom Trash folder
+**3. Verify (dry-run)**
 
-By default, the Trash folder is auto-detected via RFC 6154 `\Trash` attribute. Override with `-T`:
+```bash
+python3 imap_dedup.py --apply plan.json --dry-run
+```
+
+**4. Apply (move to Trash)**
+
+```bash
+python3 imap_dedup.py --apply plan.json
+```
+
+**5. Re-sync**
+
+```bash
+./sync-mailbox.sh
+```
+
+### Additional options
+
+**Scan only (no export or deletion):**
+
+```bash
+python3 imap_dedup.py ~/Maildir
+python3 imap_dedup.py ~/Maildir --verbose    # show every duplicate group
+```
+
+**Permanent delete (EXPUNGE) instead of Trash:**
+
+```bash
+python3 imap_dedup.py --apply plan.json --permanent
+```
+
+**Custom Trash folder** (overrides RFC 6154 `\Trash` auto-detection):
 
 ```bash
 python3 imap_dedup.py --apply plan.json --imap-trash "Deleted Messages"
