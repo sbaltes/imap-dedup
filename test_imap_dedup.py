@@ -1,5 +1,6 @@
 """Comprehensive test suite for imap_dedup.py."""
 
+import imaplib
 import json
 import os
 import time
@@ -840,6 +841,24 @@ class TestImapConnect:
         with pytest.raises(SystemExit, match="No password"):
             imap_dedup.imap_connect("imap.test.com")
 
+    @patch("netrc.netrc", side_effect=FileNotFoundError("~/.netrc not found"))
+    @patch("ssl.create_default_context")
+    @patch("imaplib.IMAP4_SSL")
+    def test_connection_closed_on_netrc_error(self, mock_imap, mock_ssl, mock_netrc):
+        with pytest.raises(SystemExit):
+            imap_dedup.imap_connect("imap.test.com")
+        mock_imap.return_value.logout.assert_called_once()
+
+    @patch("netrc.netrc")
+    @patch("ssl.create_default_context")
+    @patch("imaplib.IMAP4_SSL")
+    def test_connection_closed_on_login_error(self, mock_imap, mock_ssl, mock_netrc):
+        mock_netrc.return_value.authenticators.return_value = ("user", None, "pass")
+        mock_imap.return_value.login.side_effect = imaplib.IMAP4.error("login failed")
+        with pytest.raises(imaplib.IMAP4.error):
+            imap_dedup.imap_connect("imap.test.com")
+        mock_imap.return_value.logout.assert_called_once()
+
 
 class TestImapVerifyAndDelete:
     def _make_fetch_response(self, message_id):
@@ -1018,6 +1037,18 @@ class TestImapVerifyAndDelete:
         store_calls = [c for c in conn.uid.call_args_list if c[0][0] == "STORE"]
         assert len(store_calls) == 1
         conn.expunge.assert_called_once()
+
+    def test_short_tuple_in_fetch_response(self):
+        """A tuple with length < 2 should count as mismatch, not IndexError."""
+        conn = MagicMock()
+        conn.select.return_value = ("OK", [b"1"])
+        conn.uid.return_value = ("OK", [(b"1 (FLAGS (\\Seen))",)])
+        entries = [{"uid": 42, "message_id": "abc@ex.com"}]
+        verified, mismatched, deleted = imap_dedup.imap_verify_and_delete(
+            conn, "INBOX", entries, delete=False,
+        )
+        assert mismatched == 1
+        assert verified == 0
 
     def test_move_failure(self):
         """MOVE failure results in deleted=0."""
@@ -1839,6 +1870,29 @@ class TestImapParseListEntry:
         assert b"\\NonExistent" in attrs
         assert name == "OldFolder"
 
+    def test_nil_delimiter(self):
+        item = b'(\\All) NIL "INBOX"'
+        result = imap_dedup.imap_parse_list_entry(item)
+        assert result is not None
+        attrs, name = result
+        assert b"\\All" in attrs
+        assert name == "INBOX"
+
+    def test_unquoted_folder_name(self):
+        item = b'(\\HasNoChildren) "/" INBOX'
+        result = imap_dedup.imap_parse_list_entry(item)
+        assert result is not None
+        attrs, name = result
+        assert b"\\HasNoChildren" in attrs
+        assert name == "INBOX"
+
+    def test_escaped_quote_in_folder_name(self):
+        item = b'(\\HasNoChildren) "/" "Folder\\"Name"'
+        result = imap_dedup.imap_parse_list_entry(item)
+        assert result is not None
+        _, name = result
+        assert name == 'Folder"Name'
+
 
 # ---------------------------------------------------------------------------
 # imap_list_all_folders
@@ -1952,6 +2006,12 @@ class TestImapFetchAllMessageIds:
         result = imap_dedup.imap_fetch_all_message_ids(conn, "INBOX")
         assert result == {}
 
+    def test_non_numeric_select_response(self):
+        conn = MagicMock()
+        conn.select.return_value = ("OK", [b"not-a-number"])
+        result = imap_dedup.imap_fetch_all_message_ids(conn, "INBOX")
+        assert result is None
+
 
 # ---------------------------------------------------------------------------
 # imap_copy_messages
@@ -2019,6 +2079,11 @@ class TestImapFolderMessageCount:
         conn = MagicMock()
         conn.select.return_value = ("NO", [b"Error"])
         assert imap_dedup.imap_folder_message_count(conn, "Bad") == 0
+
+    def test_non_numeric_select_response(self):
+        conn = MagicMock()
+        conn.select.return_value = ("OK", [b"not-a-number"])
+        assert imap_dedup.imap_folder_message_count(conn, "INBOX") == 0
 
 
 # ---------------------------------------------------------------------------

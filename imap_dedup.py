@@ -690,16 +690,23 @@ def imap_connect(host: str) -> imaplib.IMAP4_SSL:
     ctx = ssl.create_default_context()
     conn = imaplib.IMAP4_SSL(host, ssl_context=ctx)
     try:
-        nrc = netrc.netrc()
-        auth = nrc.authenticators(host)
-    except (FileNotFoundError, netrc.NetrcParseError) as e:
-        raise SystemExit(f"ERROR: Cannot read ~/.netrc: {e}")
-    if auth is None:
-        raise SystemExit(f"ERROR: No entry for {host} in ~/.netrc")
-    login, _, password = auth
-    if password is None:
-        raise SystemExit(f"ERROR: No password for {host} in ~/.netrc")
-    conn.login(login, password)
+        try:
+            nrc = netrc.netrc()
+            auth = nrc.authenticators(host)
+        except (FileNotFoundError, netrc.NetrcParseError) as e:
+            raise SystemExit(f"ERROR: Cannot read ~/.netrc: {e}")
+        if auth is None:
+            raise SystemExit(f"ERROR: No entry for {host} in ~/.netrc")
+        login, _, password = auth
+        if password is None:
+            raise SystemExit(f"ERROR: No password for {host} in ~/.netrc")
+        conn.login(login, password)
+    except BaseException:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+        raise
     return conn
 
 
@@ -709,11 +716,21 @@ def imap_parse_list_entry(item: bytes) -> tuple[set[bytes], str] | None:
     Expected format: (\\Flag1 \\Flag2) "delimiter" "folder_name"
     Returns None if the entry cannot be parsed.
     """
-    m = re.match(rb'\(([^)]*)\)\s+"([^"]*)"\s+"?([^"]*)"?', item)
+    m = re.match(
+        rb'\(([^)]*)\)\s+'
+        rb'(?:"[^"]*"|NIL)\s+'
+        rb'(?:"((?:[^"\\]|\\.)*)"|(\S+))',
+        item,
+    )
     if not m:
         return None
     flags_raw = m.group(1)
-    folder_name = m.group(3).decode("utf-8", errors="replace")
+    # Quoted name in group(2), unquoted in group(3)
+    raw_name = m.group(2) if m.group(2) is not None else m.group(3)
+    # Unescape backslash-escaped characters in quoted names
+    if m.group(2) is not None:
+        raw_name = re.sub(rb'\\(.)', rb'\1', raw_name)
+    folder_name = raw_name.decode("utf-8", errors="replace")
     attributes = {f.strip() for f in flags_raw.split() if f.strip()}
     return attributes, folder_name
 
@@ -723,7 +740,7 @@ def imap_list_all_folders(conn: imaplib.IMAP4_SSL) -> list[tuple[str, set[bytes]
 
     Returns [(folder_name, attributes_set), ...].
     """
-    typ, data = conn.list('', '*')
+    typ, data = conn.list('""', '*')
     if typ != "OK":
         return []
     results = []
@@ -763,7 +780,10 @@ def imap_fetch_all_message_ids(
         return None
 
     # Get message count
-    num_messages = int(data[0])
+    try:
+        num_messages = int(data[0])
+    except (ValueError, TypeError):
+        return None
     if num_messages == 0:
         return {}
 
@@ -856,7 +876,10 @@ def imap_folder_message_count(
     typ, data = conn.select(imap_quote_folder(folder), readonly=True)
     if typ != "OK":
         return 0
-    return int(data[0])
+    try:
+        return int(data[0])
+    except (ValueError, TypeError):
+        return 0
 
 
 def clean_hidden_folders(
@@ -992,6 +1015,10 @@ def clean_hidden_folders(
         if total_orphaned > 0:
             # Create rescue folder if needed
             conn.create(imap_quote_folder(rescue_folder))  # OK if already exists
+            typ, _ = conn.select(imap_quote_folder(rescue_folder))
+            if typ != "OK":
+                print(f"ERROR: Cannot create/access rescue folder {rescue_folder}", file=sys.stderr)
+                return 1
             if not quiet:
                 print(f"\nCopying {total_orphaned} orphaned message(s) to {rescue_folder}...")
 
@@ -1218,6 +1245,7 @@ def imap_verify_and_delete(
     verified = 0
     mismatched = 0
     uids_to_delete: list[str] = []
+    hdr_parser = email.parser.BytesHeaderParser(policy=email.policy.compat32)
 
     for entry in entries:
         uid = str(entry["uid"])
@@ -1231,11 +1259,16 @@ def imap_verify_and_delete(
             continue
 
         # Parse the fetched header (using BytesHeaderParser to handle folded headers)
-        raw_header = data[0][1] if isinstance(data[0], tuple) else data[0]
+        if isinstance(data[0], tuple) and len(data[0]) >= 2:
+            raw_header = data[0][1]
+        elif isinstance(data[0], tuple):
+            mismatched += 1
+            continue
+        else:
+            raw_header = data[0]
         if isinstance(raw_header, str):
             raw_header = raw_header.encode("utf-8", errors="replace")
 
-        hdr_parser = email.parser.BytesHeaderParser(policy=email.policy.compat32)
         parsed = hdr_parser.parsebytes(raw_header)
         mid_value = parsed.get("Message-ID")
         fetched_mid = normalize_message_id(mid_value) if mid_value else ""
