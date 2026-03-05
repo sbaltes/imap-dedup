@@ -2451,8 +2451,38 @@ class TestShowDiff:
         out = capsys.readouterr().out
         assert "KEEP: Sent" in out
         assert "DELETE: INBOX" in out
-        assert "-AAA" in out
-        assert "+BBB" in out
+        assert "- AAA" in out
+        assert "+ BBB" in out
+
+    def test_color_output_when_tty(self, tmp_path, capsys):
+        keep = self._make_msg(tmp_path, "keep", "Sent", body="AAA\n")
+        dup = self._make_msg(tmp_path, "dup", "INBOX", body="BBB\n")
+        with patch("sys.stdout.isatty", return_value=True):
+            imap_dedup.show_diff(keep, dup)
+        out = capsys.readouterr().out
+        assert "\033[31m" in out  # red for keep
+        assert "\033[32m" in out  # green for dup
+        assert "\033[0m" in out   # reset
+
+    def test_compact_inline_preserves_short_equal(self):
+        keep = "Hello world XYZ end"
+        dup = "Hello world ABC end"
+        k, d = imap_dedup._compact_inline_pair(keep, dup)
+        # Short equal segments preserved, not collapsed to '...'
+        assert "Hello world " in k
+        assert " end" in k
+        assert "XYZ" in k
+        assert "ABC" in d
+
+    def test_compact_inline_collapses_long_equal(self):
+        prefix = "A" * 30
+        keep = f"{prefix}XYZ"
+        dup = f"{prefix}ABC"
+        k, d = imap_dedup._compact_inline_pair(keep, dup)
+        # Long equal segment should be collapsed with context
+        assert "..." in k
+        assert "XYZ" in k
+        assert "ABC" in d
 
 
 class TestReviewOneByOneDiff:

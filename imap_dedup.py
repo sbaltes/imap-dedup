@@ -631,22 +631,113 @@ def render_email_for_diff(path: Path) -> list[str]:
     return lines
 
 
+def _compact_inline_pair(
+    keep_line: str, dup_line: str, *, use_color: bool = False,
+) -> tuple[str, str]:
+    """Render a compact inline diff for a changed line pair.
+
+    Returns two lines showing the changed portions highlighted with optional
+    ANSI color, preserving short equal segments and showing context around
+    collapsed ones.
+    """
+    sm = difflib.SequenceMatcher(None, keep_line, dup_line)
+    keep_parts: list[str] = []
+    dup_parts: list[str] = []
+
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    RESET = "\033[0m"
+
+    context_chars = 8
+    min_collapse = 20
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            seg = keep_line[i1:i2]
+            if len(seg) < min_collapse:
+                keep_parts.append(seg)
+                dup_parts.append(seg)
+            else:
+                prefix = seg[:context_chars]
+                suffix = seg[-context_chars:]
+                collapsed = f"{prefix}...{suffix}"
+                keep_parts.append(collapsed)
+                dup_parts.append(collapsed)
+        else:
+            if tag in ("replace", "delete"):
+                chunk = keep_line[i1:i2]
+                if use_color:
+                    keep_parts.append(f"{RED}{chunk}{RESET}")
+                else:
+                    keep_parts.append(chunk)
+            if tag in ("replace", "insert"):
+                chunk = dup_line[j1:j2]
+                if use_color:
+                    dup_parts.append(f"{GREEN}{chunk}{RESET}")
+                else:
+                    dup_parts.append(chunk)
+    return "".join(keep_parts), "".join(dup_parts)
+
+
 def show_diff(keep: MessageInfo, dup: MessageInfo) -> None:
-    """Print a unified diff between the kept and duplicate message."""
+    """Print a compact inline diff between the kept and duplicate message."""
     keep_lines = render_email_for_diff(keep.path)
     dup_lines = render_email_for_diff(dup.path)
 
-    diff = difflib.unified_diff(
-        keep_lines,
-        dup_lines,
-        fromfile=f"KEEP: {keep.folder}",
-        tofile=f"DELETE: {dup.folder}",
+    diff = list(
+        difflib.unified_diff(
+            keep_lines,
+            dup_lines,
+            fromfile=f"KEEP: {keep.folder}",
+            tofile=f"DELETE: {dup.folder}",
+        )
     )
-    output = "".join(diff)
-    if output:
-        print(output)
-    else:
+    if not diff:
         print("  (no differences found)")
+        return
+
+    use_color = sys.stdout.isatty()
+
+    # Print header lines (--- and +++)
+    for line in diff[:2]:
+        print(line, end="" if line.endswith("\n") else "\n")
+
+    # Collect and process hunks
+    minus_lines: list[str] = []
+    plus_lines: list[str] = []
+
+    def flush_pairs() -> None:
+        paired = min(len(minus_lines), len(plus_lines))
+        for k in range(paired):
+            ml = minus_lines[k].rstrip("\n")
+            pl = plus_lines[k].rstrip("\n")
+            keep_text, dup_text = _compact_inline_pair(
+                ml, pl, use_color=use_color,
+            )
+            print(f"- {keep_text}")
+            print(f"+ {dup_text}")
+        # Unpaired lines shown in full
+        for k in range(paired, len(minus_lines)):
+            print(f"- {minus_lines[k].rstrip(chr(10))}")
+        for k in range(paired, len(plus_lines)):
+            print(f"+ {plus_lines[k].rstrip(chr(10))}")
+        minus_lines.clear()
+        plus_lines.clear()
+
+    for line in diff[2:]:
+        if line.startswith("@@"):
+            flush_pairs()
+            continue
+        if line.startswith("-"):
+            if plus_lines:
+                flush_pairs()
+            minus_lines.append(line[1:])
+        elif line.startswith("+"):
+            plus_lines.append(line[1:])
+        else:
+            # Context line — skip for compact output
+            flush_pairs()
+    flush_pairs()
 
 
 def _review_one_by_one(
