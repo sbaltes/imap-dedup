@@ -88,8 +88,9 @@ def normalize_message_id(raw: str) -> str:
     return raw.strip().strip("<>").strip().lower()
 
 
-def decode_header(raw: str) -> str:
+def decode_header(raw) -> str:
     """Decode RFC 2047 encoded header value to a Unicode string."""
+    raw = str(raw)
     try:
         parts = email.header.decode_header(raw)
         decoded = []
@@ -1505,7 +1506,7 @@ def export_plan(
             "uid": keep_uid,
             "imap_folder": local_to_imap_folder(group.keep.folder),
             "message_id": group.keep.message_id,
-            "subject": group.keep.subject,
+            "subject": str(group.keep.subject),
         }
 
         delete_entries = []
@@ -1520,7 +1521,7 @@ def export_plan(
                 "uid": dup_uid,
                 "imap_folder": local_to_imap_folder(dup.folder),
                 "message_id": dup.message_id,
-                "subject": dup.subject,
+                "subject": str(dup.subject),
                 "flags": dup.flags,
                 "size": dup.size,
             })

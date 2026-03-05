@@ -1453,6 +1453,51 @@ class TestExportPlanTimestamp:
         assert plan["groups"][0]["delete"][0]["message_id"] == "test@ex.com"
 
 
+class TestDecodeHeaderEdgeCases:
+    def test_header_object_converted_to_string(self):
+        """email.header.Header objects must be converted to plain strings."""
+        import email.header
+        hdr = email.header.Header("Wohnung in der Straße", "utf-8")
+        result = imap_dedup.decode_header(hdr)
+        assert isinstance(result, str)
+        assert "Wohnung" in result
+
+    def test_rfc2047_encoded_header(self):
+        result = imap_dedup.decode_header("=?utf-8?B?w5xiZXJ3ZWlzdW5n?=")
+        assert isinstance(result, str)
+        assert result == "Überweisung"
+
+
+class TestExportPlanJsonSerializable:
+    def test_header_object_in_subject_is_serializable(self, tmp_path):
+        """Regression: Header objects in subject must not break JSON export."""
+        import email.header
+        keep_path = tmp_path / "1234567890.M100,S=5000,U=10:2,FS"
+        keep_path.write_bytes(b"keep")
+        dup_path = tmp_path / "1234567891.M101,S=5000,U=20:2,S"
+        dup_path.write_bytes(b"dup")
+        # Simulate a Header object ending up in the subject field
+        hdr_subject = email.header.Header("Überweisung Miete", "utf-8")
+        keep = imap_dedup.MessageInfo(
+            path=keep_path, folder="INBOX", subject=hdr_subject, date="date",
+            flags="FS", size=5000, mtime=time.time(),
+            dedup_key="test@ex.com", method="message-id", message_id="test@ex.com",
+        )
+        dup = imap_dedup.MessageInfo(
+            path=dup_path, folder="Sent", subject=hdr_subject, date="date",
+            flags="S", size=1000, mtime=time.time(),
+            dedup_key="test@ex.com", method="message-id", message_id="test@ex.com",
+        )
+        group = imap_dedup.DuplicateGroup(keep=keep, duplicates=[dup])
+        out = str(tmp_path / "plan.json")
+        # This used to raise: TypeError: Object of type Header is not JSON serializable
+        imap_dedup.export_plan([group], out, "imap.test.com", quiet=True)
+        plan = json.loads(Path(out).read_text())
+        assert isinstance(plan["groups"][0]["keep"]["subject"], str)
+        assert isinstance(plan["groups"][0]["delete"][0]["subject"], str)
+        assert "Überweisung" in plan["groups"][0]["keep"]["subject"]
+
+
 class TestApplyPlanBackwardsCompat:
     def test_plan_without_z_suffix(self, tmp_path, capsys):
         """Plans created before the Z suffix change should still work."""
