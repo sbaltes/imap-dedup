@@ -90,6 +90,7 @@ python3 imap_dedup.py ~/Maildir --interactive --export plan.json --imap-host ima
 
 - `--sender` ensures Sent folder priority only applies to your own emails
 - `--interactive` lets you review duplicates folder-by-folder before committing to the plan
+- In one-by-one review mode, press `d` to see a unified diff between the kept and deleted copy
 
 **3. Verify (dry-run)**
 

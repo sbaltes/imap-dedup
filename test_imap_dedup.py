@@ -2308,3 +2308,204 @@ class TestNewModeCLIValidation:
         with patch("sys.argv", ["prog", "--dry-run"]):
             rc = imap_dedup.main()
         assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# render_email_for_diff / show_diff / diff in interactive review
+# ---------------------------------------------------------------------------
+
+def _write_email(path, subject="Hello", body="Hello world\n", from_addr="a@b.com",
+                 date="Mon, 01 Jan 2024 12:00:00 +0000", extra_headers="",
+                 content_type="text/plain"):
+    """Write a minimal RFC 5322 email file to *path*."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = (
+        f"From: {from_addr}\n"
+        f"To: x@y.com\n"
+        f"Subject: {subject}\n"
+        f"Date: {date}\n"
+        f"Message-ID: <test@example.com>\n"
+        f"Content-Type: {content_type}\n"
+        f"{extra_headers}"
+        f"\n"
+        f"{body}"
+    )
+    path.write_text(raw)
+
+
+class TestRenderEmailForDiff:
+    def test_basic_email(self, tmp_path):
+        p = tmp_path / "msg1"
+        _write_email(p, subject="Hello", body="Line 1\nLine 2\n")
+        lines = imap_dedup.render_email_for_diff(p)
+        # Should contain the headers we care about
+        assert any("Subject: Hello" in l for l in lines)
+        assert any("From: a@b.com" in l for l in lines)
+        # Should contain body lines
+        assert "Line 1\n" in lines
+        assert "Line 2\n" in lines
+
+    def test_missing_file(self, tmp_path):
+        p = tmp_path / "nonexistent"
+        lines = imap_dedup.render_email_for_diff(p)
+        assert len(lines) == 1
+        assert "could not read" in lines[0]
+
+    def test_multipart_email(self, tmp_path):
+        p = tmp_path / "multipart"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        raw = (
+            "From: a@b.com\n"
+            "To: x@y.com\n"
+            "Subject: Multi\n"
+            "Date: Mon, 01 Jan 2024 12:00:00 +0000\n"
+            "Message-ID: <multi@example.com>\n"
+            "MIME-Version: 1.0\n"
+            'Content-Type: multipart/alternative; boundary="BOUND"\n'
+            "\n"
+            "--BOUND\n"
+            "Content-Type: text/plain\n"
+            "\n"
+            "Plain text body\n"
+            "--BOUND\n"
+            "Content-Type: text/html\n"
+            "\n"
+            "<p>HTML body</p>\n"
+            "--BOUND--\n"
+        )
+        p.write_text(raw)
+        lines = imap_dedup.render_email_for_diff(p)
+        assert any("text/plain" in l for l in lines)
+        assert any("text/html" in l for l in lines)
+        assert any("Plain text body" in l for l in lines)
+
+    def test_binary_attachment(self, tmp_path):
+        p = tmp_path / "binary_msg"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        raw = (
+            b"From: a@b.com\n"
+            b"To: x@y.com\n"
+            b"Subject: With attachment\n"
+            b"Date: Mon, 01 Jan 2024 12:00:00 +0000\n"
+            b"Message-ID: <bin@example.com>\n"
+            b"MIME-Version: 1.0\n"
+            b'Content-Type: multipart/mixed; boundary="BOUND"\n'
+            b"\n"
+            b"--BOUND\n"
+            b"Content-Type: text/plain\n"
+            b"\n"
+            b"Some text\n"
+            b"--BOUND\n"
+            b"Content-Type: application/octet-stream\n"
+            b"Content-Transfer-Encoding: base64\n"
+            b"\n"
+            b"AAAA\n"
+            b"--BOUND--\n"
+        )
+        p.write_bytes(raw)
+        lines = imap_dedup.render_email_for_diff(p)
+        assert any("binary content" in l for l in lines)
+        assert any("Some text" in l for l in lines)
+
+    def test_non_multipart_binary(self, tmp_path):
+        p = tmp_path / "bin_single"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        raw = (
+            b"From: a@b.com\n"
+            b"To: x@y.com\n"
+            b"Subject: Binary\n"
+            b"Date: Mon, 01 Jan 2024 12:00:00 +0000\n"
+            b"Message-ID: <bin2@example.com>\n"
+            b"Content-Type: application/octet-stream\n"
+            b"Content-Transfer-Encoding: base64\n"
+            b"\n"
+            b"AAAA\n"
+        )
+        p.write_bytes(raw)
+        lines = imap_dedup.render_email_for_diff(p)
+        assert any("binary content" in l for l in lines)
+
+
+class TestShowDiff:
+    def _make_msg(self, tmp_path, name, folder, body="Hello\n"):
+        p = tmp_path / folder / name
+        _write_email(p, body=body)
+        return imap_dedup.MessageInfo(
+            path=p, folder=folder, subject="Hello",
+            date="Mon, 01 Jan 2024 12:00:00 +0000", flags="S",
+            size=100, mtime=1700000000.0, dedup_key="test@example.com",
+            method="message-id", message_id="test@example.com",
+        )
+
+    def test_identical_messages(self, tmp_path, capsys):
+        keep = self._make_msg(tmp_path, "keep", "Sent")
+        dup = self._make_msg(tmp_path, "dup", "INBOX")
+        imap_dedup.show_diff(keep, dup)
+        out = capsys.readouterr().out
+        assert "no differences found" in out
+
+    def test_different_bodies(self, tmp_path, capsys):
+        keep = self._make_msg(tmp_path, "keep", "Sent", body="AAA\n")
+        dup = self._make_msg(tmp_path, "dup", "INBOX", body="BBB\n")
+        imap_dedup.show_diff(keep, dup)
+        out = capsys.readouterr().out
+        assert "KEEP: Sent" in out
+        assert "DELETE: INBOX" in out
+        assert "-AAA" in out
+        assert "+BBB" in out
+
+
+class TestReviewOneByOneDiff:
+    def _make_entries(self, tmp_path):
+        entries = []
+        for i in range(2):
+            keep_path = tmp_path / "Sent" / f"keep{i}"
+            dup_path = tmp_path / "INBOX" / f"dup{i}"
+            _write_email(keep_path, body=f"keep body {i}\n")
+            _write_email(dup_path, body=f"dup body {i}\n")
+            keep = imap_dedup.MessageInfo(
+                path=keep_path, folder="Sent", subject="Test",
+                date="Mon, 01 Jan 2024 12:00:00 +0000", flags="S",
+                size=100, mtime=1700000000.0 + i,
+                dedup_key=f"msg{i}@b.com", method="message-id",
+                message_id=f"msg{i}@b.com",
+            )
+            dup = imap_dedup.MessageInfo(
+                path=dup_path, folder="INBOX", subject="Test",
+                date="Mon, 01 Jan 2024 12:00:00 +0000", flags="S",
+                size=100, mtime=1700000001.0 + i,
+                dedup_key=f"msg{i}@b.com", method="message-id",
+                message_id=f"msg{i}@b.com",
+            )
+            group = imap_dedup.DuplicateGroup(keep=keep, duplicates=[dup])
+            entries.append((group, [dup]))
+        return entries
+
+    @patch("builtins.input", side_effect=["d", "y", "n"])
+    def test_diff_then_accept(self, mock_input, tmp_path, capsys):
+        entries = self._make_entries(tmp_path)
+        result = imap_dedup._review_one_by_one(entries)
+        assert result is not None
+        assert len(result) == 1  # first accepted, second skipped
+        out = capsys.readouterr().out
+        # diff was shown for the first entry
+        assert "KEEP:" in out or "DELETE:" in out
+
+    @patch("builtins.input", side_effect=["d", "d", "y", "y"])
+    def test_diff_multiple_times(self, mock_input, tmp_path):
+        entries = self._make_entries(tmp_path)
+        result = imap_dedup._review_one_by_one(entries)
+        assert result is not None
+        assert len(result) == 2  # both accepted
+
+    @patch("builtins.input", side_effect=["d", "q"])
+    def test_diff_then_quit(self, mock_input, tmp_path):
+        entries = self._make_entries(tmp_path)
+        result = imap_dedup._review_one_by_one(entries)
+        assert result is None
+
+    @patch("builtins.input", side_effect=["d", EOFError])
+    def test_diff_then_eof(self, mock_input, tmp_path):
+        entries = self._make_entries(tmp_path)
+        result = imap_dedup._review_one_by_one(entries)
+        assert result is None

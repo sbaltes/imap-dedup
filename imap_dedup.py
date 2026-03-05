@@ -16,6 +16,7 @@ if sys.version_info < (3, 10):
     sys.exit("ERROR: Python 3.10 or newer is required.")
 
 import argparse
+import difflib
 import email.errors
 import email.header
 import email.message
@@ -590,6 +591,64 @@ def review_folder_interactive(
     return _review_one_by_one(entries)
 
 
+def render_email_for_diff(path: Path) -> list[str]:
+    """Read an email file and return lines suitable for difflib comparison."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return [f"(could not read {path})\n"]
+
+    parser = email.parser.BytesParser(policy=email.policy.default)
+    msg = parser.parsebytes(raw)
+
+    lines: list[str] = []
+    for hdr in ("Date", "From", "To", "Cc", "Subject", "Message-ID"):
+        val = msg.get(hdr)
+        if val is not None:
+            lines.append(f"{hdr}: {val}\n")
+    lines.append("\n")
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            if ct.startswith("multipart/"):
+                continue
+            lines.append(f"--- part: {ct} ---\n")
+            payload = part.get_content()
+            if isinstance(payload, str):
+                for line in payload.splitlines(keepends=True):
+                    lines.append(line if line.endswith("\n") else line + "\n")
+            elif isinstance(payload, bytes):
+                lines.append(f"(binary content, {len(payload)} bytes)\n")
+    else:
+        payload = msg.get_content()
+        if isinstance(payload, str):
+            for line in payload.splitlines(keepends=True):
+                lines.append(line if line.endswith("\n") else line + "\n")
+        elif isinstance(payload, bytes):
+            lines.append(f"(binary content, {len(payload)} bytes)\n")
+
+    return lines
+
+
+def show_diff(keep: MessageInfo, dup: MessageInfo) -> None:
+    """Print a unified diff between the kept and duplicate message."""
+    keep_lines = render_email_for_diff(keep.path)
+    dup_lines = render_email_for_diff(dup.path)
+
+    diff = difflib.unified_diff(
+        keep_lines,
+        dup_lines,
+        fromfile=f"KEEP: {keep.folder}",
+        tofile=f"DELETE: {dup.folder}",
+    )
+    output = "".join(diff)
+    if output:
+        print(output)
+    else:
+        print("  (no differences found)")
+
+
 def _review_one_by_one(
     entries: list[tuple[DuplicateGroup, list[MessageInfo]]],
 ) -> list[tuple[DuplicateGroup, list[MessageInfo]]] | None:
@@ -598,11 +657,18 @@ def _review_one_by_one(
     for i, (group, dupes) in enumerate(entries, 1):
         print()
         print(format_interactive_entry(i, group, dupes))
-        ch = interactive_prompt(
-            f"  Delete this duplicate? [y]es / [n]o / [q]uit: ", "ynq"
-        )
-        if ch is None or ch == "q":
-            return None
+        while True:
+            ch = interactive_prompt(
+                f"  Delete this duplicate? [y]es / [n]o / [d]iff / [q]uit: ",
+                "yndq",
+            )
+            if ch is None or ch == "q":
+                return None
+            if ch == "d":
+                for dup in dupes:
+                    show_diff(group.keep, dup)
+                continue
+            break
         if ch == "y":
             accepted.append((group, dupes))
     return accepted
