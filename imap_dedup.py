@@ -1385,6 +1385,7 @@ def imap_verify_and_delete(
     trash_folder: str = "Trash",
     verbose: bool = False,
     quiet: bool = False,
+    batch_size: int = 500,
 ) -> tuple[int, int, int]:
     """Verify and optionally delete messages in one IMAP folder.
 
@@ -1447,26 +1448,35 @@ def imap_verify_and_delete(
 
     deleted = 0
     if uids_to_delete:
-        uid_set = ",".join(uids_to_delete)
+        # Batch UIDs to avoid exceeding IMAP command length limits.
         if permanent:
-            typ, _ = conn.uid("STORE", uid_set, "+FLAGS", "(\\Deleted)")
-            if typ == "OK":
+            for i in range(0, len(uids_to_delete), batch_size):
+                batch = uids_to_delete[i : i + batch_size]
+                uid_set = ",".join(batch)
+                typ, _ = conn.uid("STORE", uid_set, "+FLAGS", "(\\Deleted)")
+                if typ == "OK":
+                    deleted += len(batch)
+                else:
+                    print(f"  ERROR: Failed to flag messages for deletion in {folder}",
+                          file=sys.stderr)
+                    break
+            if deleted:
                 conn.expunge()
-                deleted = len(uids_to_delete)
                 if not quiet:
                     print(f"    Deleted {deleted} message(s) from {folder}")
-            else:
-                print(f"  ERROR: Failed to flag messages for deletion in {folder}",
-                      file=sys.stderr)
         else:
-            typ, _ = conn.uid("MOVE", uid_set, imap_quote_folder(trash_folder))
-            if typ == "OK":
-                deleted = len(uids_to_delete)
-                if not quiet:
-                    print(f"    Moved {deleted} message(s) from {folder} to {trash_folder}")
-            else:
-                print(f"  ERROR: Failed to move messages to {trash_folder} in {folder}",
-                      file=sys.stderr)
+            for i in range(0, len(uids_to_delete), batch_size):
+                batch = uids_to_delete[i : i + batch_size]
+                uid_set = ",".join(batch)
+                typ, _ = conn.uid("MOVE", uid_set, imap_quote_folder(trash_folder))
+                if typ == "OK":
+                    deleted += len(batch)
+                else:
+                    print(f"  ERROR: Failed to move messages to {trash_folder} in {folder}",
+                          file=sys.stderr)
+                    break
+            if deleted and not quiet:
+                print(f"    Moved {deleted} message(s) from {folder} to {trash_folder}")
 
     return verified, mismatched, deleted
 

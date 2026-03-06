@@ -1066,6 +1066,60 @@ class TestImapVerifyAndDelete:
         assert verified == 1
         assert deleted == 0
 
+    def test_batched_delete(self):
+        """Permanent delete batches STORE calls and calls EXPUNGE once."""
+        conn = MagicMock()
+        conn.select.return_value = ("OK", [b"1200"])
+        num_entries = 1200
+        entries = [
+            {"uid": i, "message_id": f"msg{i}@ex.com"}
+            for i in range(1, num_entries + 1)
+        ]
+        fetch_responses = [
+            ("OK", self._make_fetch_response(f"msg{i}@ex.com"))
+            for i in range(1, num_entries + 1)
+        ]
+        store_responses = [("OK", None)] * 3  # 3 batches: 500+500+200
+        conn.uid.side_effect = fetch_responses + store_responses
+
+        verified, mismatched, deleted = imap_dedup.imap_verify_and_delete(
+            conn, "INBOX", entries, delete=True, permanent=True,
+            batch_size=500,
+        )
+        assert verified == 1200
+        assert mismatched == 0
+        assert deleted == 1200
+        store_calls = [c for c in conn.uid.call_args_list if c[0][0] == "STORE"]
+        assert len(store_calls) == 3
+        conn.expunge.assert_called_once()
+
+    def test_batched_move(self):
+        """Non-permanent delete batches MOVE calls."""
+        conn = MagicMock()
+        conn.select.return_value = ("OK", [b"1200"])
+        num_entries = 1200
+        entries = [
+            {"uid": i, "message_id": f"msg{i}@ex.com"}
+            for i in range(1, num_entries + 1)
+        ]
+        fetch_responses = [
+            ("OK", self._make_fetch_response(f"msg{i}@ex.com"))
+            for i in range(1, num_entries + 1)
+        ]
+        move_responses = [("OK", None)] * 3  # 3 batches: 500+500+200
+        conn.uid.side_effect = fetch_responses + move_responses
+
+        verified, mismatched, deleted = imap_dedup.imap_verify_and_delete(
+            conn, "INBOX", entries, delete=True, permanent=False,
+            trash_folder="Trash", batch_size=500,
+        )
+        assert verified == 1200
+        assert mismatched == 0
+        assert deleted == 1200
+        move_calls = [c for c in conn.uid.call_args_list if c[0][0] == "MOVE"]
+        assert len(move_calls) == 3
+        conn.expunge.assert_not_called()
+
 
 class TestImapFindTrashFolder:
     def test_detects_trash_attribute(self):
