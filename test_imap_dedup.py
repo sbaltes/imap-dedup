@@ -2351,6 +2351,17 @@ class TestCleanHiddenFolders:
         assert rc == 0
 
     @patch("imap_dedup.imap_connect")
+    def test_keyboard_interrupt_returns_1(self, mock_connect):
+        """KeyboardInterrupt calls shutdown() but not logout()."""
+        conn = self._mock_conn()
+        mock_connect.return_value = conn
+        conn.select.side_effect = KeyboardInterrupt
+        rc = imap_dedup.clean_hidden_folders("host", quiet=True)
+        assert rc == 1
+        conn.shutdown.assert_called_once()
+        conn.logout.assert_not_called()
+
+    @patch("imap_dedup.imap_connect")
     def test_clean_hidden_requires_imap_host_via_cli(self, mock_connect):
         with patch("sys.argv", ["prog", "--clean-hidden"]):
             rc = imap_dedup.main()
@@ -2448,6 +2459,17 @@ class TestPruneNoselectFolders:
         assert len(delete_calls) == 2
         assert "A/B" in delete_calls[0][0][0]
         assert delete_calls[1][0][0] == '"A"'
+
+    @patch("imap_dedup.imap_connect")
+    def test_keyboard_interrupt_returns_1(self, mock_connect):
+        """KeyboardInterrupt calls shutdown() but not logout()."""
+        conn = MagicMock()
+        conn.list.side_effect = KeyboardInterrupt
+        mock_connect.return_value = conn
+        rc = imap_dedup.prune_noselect_folders("host", quiet=True)
+        assert rc == 1
+        conn.shutdown.assert_called_once()
+        conn.logout.assert_not_called()
 
     @patch("imap_dedup.imap_connect")
     def test_prune_noselect_requires_imap_host_via_cli(self, mock_connect):

@@ -1063,6 +1063,7 @@ def clean_hidden_folders(
 
     conn = imap_connect(imap_host)
 
+    interrupted = False
     try:
         # 1. List all folders with attributes
         all_folders = imap_list_all_folders(conn)
@@ -1262,11 +1263,20 @@ def clean_hidden_folders(
             if delete_folders:
                 print(f"  Folders deleted: {folders_deleted}")
 
-    finally:
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        interrupted = True
         try:
-            conn.logout()
-        except (imaplib.IMAP4.error, OSError):
+            conn.shutdown()
+        except OSError:
             pass
+        return 1
+    finally:
+        if not interrupted:
+            try:
+                conn.logout()
+            except (imaplib.IMAP4.error, OSError):
+                pass
 
     return 0
 
@@ -1288,6 +1298,7 @@ def prune_noselect_folders(
 
     conn = imap_connect(imap_host)
 
+    interrupted = False
     try:
         all_folders = imap_list_all_folders(conn)
         if not all_folders:
@@ -1367,11 +1378,20 @@ def prune_noselect_folders(
         if not quiet:
             print(f"\nDeleted {deleted}/{len(prunable)} folder(s).")
 
-    finally:
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        interrupted = True
         try:
-            conn.logout()
-        except (imaplib.IMAP4.error, OSError):
+            conn.shutdown()
+        except OSError:
             pass
+        return 1
+    finally:
+        if not interrupted:
+            try:
+                conn.logout()
+            except (imaplib.IMAP4.error, OSError):
+                pass
 
     return 0
 
@@ -2052,4 +2072,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
