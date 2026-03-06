@@ -1427,6 +1427,7 @@ def imap_verify_and_delete(
 
         # Track which UIDs we got responses for
         found_uids: set[str] = set()
+        batch_mismatched = 0
 
         if typ == "OK" and data:
             # Parse multi-message response: data is a flat list where each
@@ -1458,22 +1459,20 @@ def imap_verify_and_delete(
                     verified += 1
                     if delete:
                         uids_to_delete.append(uid_str)
-                    if verbose:
-                        subj = entry.get("subject", "")
-                        print(f"    UID {uid_str}: verified ✓  {subj[:60]}")
                 else:
+                    batch_mismatched += 1
                     mismatched += 1
-                    if verbose:
-                        print(f"    UID {uid_str}: Message-ID mismatch!")
-                        print(f"      Expected: {expected_mid}")
-                        print(f"      Got:      {fetched_mid}")
 
         # UIDs not found in response count as mismatched (already deleted)
+        batch_not_found = 0
         for uid_str in batch_uids:
             if uid_str not in found_uids:
                 mismatched += 1
-                if verbose:
-                    print(f"    UID {uid_str}: not found on server (already deleted?)")
+                batch_not_found += 1
+
+        if verbose and (batch_mismatched or batch_not_found):
+            print(f"    Batch {batch_num}/{total_batches}: "
+                  f"{batch_mismatched} mismatched, {batch_not_found} not found")
 
     deleted = 0
     if uids_to_delete:
@@ -1711,6 +1710,7 @@ def apply_plan(
     total_mismatched = 0
     total_deleted = 0
 
+    interrupted = False
     try:
         for folder in sorted(by_folder):
             entries = by_folder[folder]
@@ -1726,11 +1726,20 @@ def apply_plan(
             total_verified += verified
             total_mismatched += mismatched
             total_deleted += deleted
-    finally:
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        interrupted = True
         try:
-            conn.logout()
-        except (imaplib.IMAP4.error, OSError):
+            conn.shutdown()
+        except OSError:
             pass
+        return 1
+    finally:
+        if not interrupted:
+            try:
+                conn.logout()
+            except (imaplib.IMAP4.error, OSError):
+                pass
 
     if not quiet:
         print(f"\n{'=' * 60}")

@@ -1150,6 +1150,51 @@ class TestImapVerifyAndDelete:
         assert len(move_calls) == 3
         conn.expunge.assert_not_called()
 
+    def test_verbose_logs_per_batch_not_per_message(self, capsys):
+        """Verbose output shows batch summaries, not per-message lines."""
+        conn = MagicMock()
+        conn.select.return_value = ("OK", [b"3"])
+        entries = [
+            {"uid": 1, "message_id": "a@ex.com"},
+            {"uid": 2, "message_id": "b@ex.com"},
+            {"uid": 3, "message_id": "c@ex.com"},
+        ]
+        # Batch 1 (uid 1,2): uid 1 matches, uid 2 mismatches
+        # Batch 2 (uid 3): matches
+        conn.uid.side_effect = [
+            ("OK", self._make_fetch_response([
+                (1, "a@ex.com"),
+                (2, "wrong@ex.com"),
+            ])),
+            ("OK", self._make_fetch_response([(3, "c@ex.com")])),
+        ]
+        imap_dedup.imap_verify_and_delete(
+            conn, "INBOX", entries, delete=False,
+            verbose=True, batch_size=2,
+        )
+        out = capsys.readouterr().out
+        assert "Batch " in out
+        assert "UID " not in out
+
+    def test_verbose_no_output_when_all_match(self, capsys):
+        """Verbose mode produces no batch lines when all messages match."""
+        conn = MagicMock()
+        conn.select.return_value = ("OK", [b"2"])
+        entries = [
+            {"uid": 1, "message_id": "a@ex.com"},
+            {"uid": 2, "message_id": "b@ex.com"},
+        ]
+        conn.uid.return_value = ("OK", self._make_fetch_response([
+            (1, "a@ex.com"),
+            (2, "b@ex.com"),
+        ]))
+        imap_dedup.imap_verify_and_delete(
+            conn, "INBOX", entries, delete=False,
+            verbose=True, batch_size=10,
+        )
+        out = capsys.readouterr().out
+        assert "Batch " not in out
+
 
 class TestImapFindTrashFolder:
     def test_detects_trash_attribute(self):
@@ -1420,6 +1465,24 @@ class TestApplyPlan:
         self._write_plan(f, groups=groups)
         rc = imap_dedup.apply_plan(str(f), dry_run=True, quiet=True)
         assert rc == 2
+
+    @patch("imap_dedup.imap_connect")
+    def test_keyboard_interrupt_returns_1(self, mock_connect, tmp_path):
+        """KeyboardInterrupt calls shutdown() but not logout()."""
+        mock_conn = MagicMock()
+        mock_connect.return_value = mock_conn
+        mock_conn.select.side_effect = KeyboardInterrupt
+        f = tmp_path / "plan.json"
+        groups = [{
+            "keep": {"uid": 1, "imap_folder": "INBOX", "message_id": "a@b.com", "subject": "T"},
+            "delete": [{"uid": 2, "imap_folder": "INBOX", "message_id": "a@b.com",
+                        "subject": "T", "flags": "S", "size": 100}],
+        }]
+        self._write_plan(f, groups=groups)
+        rc = imap_dedup.apply_plan(str(f), dry_run=True, quiet=True)
+        assert rc == 1
+        mock_conn.shutdown.assert_called_once()
+        mock_conn.logout.assert_not_called()
 
 
 class TestMainCLIValidation:
