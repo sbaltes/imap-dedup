@@ -180,6 +180,24 @@ python3 imap_dedup.py --prune-noselect --imap-host imap.mailbox.org
 
 Folders are deleted deepest-first to respect IMAP hierarchy constraints.
 
+### Clean stale local folders
+
+After deleting folders on the IMAP server (or after `--clean-hidden` / `--prune-noselect` remove them server-side), the local Maildir still contains the corresponding directories. The `--clean-local` mode compares local Maildir folders against the IMAP server and removes local directories that no longer exist on the server.
+
+**Preview (dry-run):**
+
+```bash
+python3 imap_dedup.py --clean-local ~/Maildir --imap-host imap.mailbox.org --dry-run
+```
+
+**Remove stale folders:**
+
+```bash
+python3 imap_dedup.py --clean-local ~/Maildir --imap-host imap.mailbox.org
+```
+
+INBOX is never removed. Only directories discovered as valid Maildir folders (with `cur`/`new` subdirectories) are considered.
+
 ## CLI reference
 
 ```
@@ -191,7 +209,8 @@ options:
   -a, --apply FILE            Apply plan via IMAP (deletes by default)
   --clean-hidden              Detect and clean hidden IMAP folders (\Noselect/\NonExistent)
   --prune-noselect            Delete empty \Noselect hierarchy nodes (no messages transitively)
-  -d, --dry-run               Preview without changes (for --apply, --clean-hidden, --prune-noselect)
+  --clean-local               Remove local Maildir folders that no longer exist on the IMAP server
+  -d, --dry-run               Preview without changes (for --apply, --clean-hidden, --prune-noselect, --clean-local)
   -p, --permanent             Permanently delete (EXPUNGE) instead of moving to Trash
   --delete-folders            Also delete empty hidden folders (requires --clean-hidden)
   --rescue-folder FOLDER      Destination for orphaned messages (default: Recovered)
@@ -225,8 +244,10 @@ options:
 | Clean hidden + custom rescue | `--clean-hidden --imap-host HOST --rescue-folder "Rescued"` |
 | Prune noselect (dry-run) | `--prune-noselect --imap-host HOST --dry-run` |
 | Prune noselect | `--prune-noselect --imap-host HOST` |
+| Clean local (dry-run) | `--clean-local ~/Maildir --imap-host HOST --dry-run` |
+| Clean local | `--clean-local ~/Maildir --imap-host HOST` |
 
-Mutually exclusive: `--export` / `--apply` / `--clean-hidden` / `--prune-noselect`, and `--interactive` / `--quiet` / `--apply`. The `--permanent` flag requires `--apply`. The `--dry-run` flag works with `--apply`, `--clean-hidden`, and `--prune-noselect`. The `--delete-folders` flag requires `--clean-hidden`. The `--interactive` flag requires a TTY. Combining `--interactive` with `--export` lets you review duplicates before writing the plan.
+Mutually exclusive: `--export` / `--apply` / `--clean-hidden` / `--prune-noselect` / `--clean-local`, and `--interactive` / `--quiet` / `--apply`. The `--permanent` flag requires `--apply`. The `--dry-run` flag works with `--apply`, `--clean-hidden`, `--prune-noselect`, and `--clean-local`. The `--delete-folders` flag requires `--clean-hidden`. The `--interactive` flag requires a TTY. Combining `--interactive` with `--export` lets you review duplicates before writing the plan.
 
 ## How duplicate detection works
 

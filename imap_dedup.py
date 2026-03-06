@@ -28,6 +28,7 @@ import json
 import netrc
 import os
 import re
+import shutil
 import ssl
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1396,6 +1397,101 @@ def prune_noselect_folders(
     return 0
 
 
+def clean_local_folders(
+    maildir_root: Path,
+    imap_host: str,
+    dry_run: bool = False,
+    verbose: bool = False,
+    quiet: bool = False,
+) -> int:
+    """Remove local Maildir folders that no longer exist on the IMAP server.
+
+    Compares local Maildir folders against the IMAP folder list and removes
+    stale local directories (those with no matching IMAP folder).
+
+    Returns exit code: 0 on success, 1 on error.
+    """
+    if not quiet:
+        print("Clean stale local folders")
+        print(f"Maildir: {maildir_root}")
+        print(f"Host: {imap_host}")
+        print()
+
+    conn = imap_connect(imap_host)
+
+    interrupted = False
+    try:
+        # 1. Get server folders
+        all_folders = imap_list_all_folders(conn)
+        imap_names = {name for name, _attrs in all_folders}
+
+        if not quiet:
+            print(f"IMAP folders: {len(imap_names)}")
+
+        # 2. Discover local folders (no include/exclude filter)
+        local_folders = discover_folders(maildir_root)
+
+        if not quiet:
+            print(f"Local folders: {len(local_folders)}")
+            print()
+
+        # 3. Find stale folders
+        stale = []
+        for display_name, folder_path in local_folders:
+            if display_name == "INBOX":
+                continue
+            imap_name = local_to_imap_folder(display_name)
+            if imap_name not in imap_names:
+                stale.append((display_name, folder_path))
+
+        if not stale:
+            if not quiet:
+                print("No stale local folders found.")
+            return 0
+
+        if not quiet:
+            print(f"Found {len(stale)} stale local folder(s):")
+            for display_name, folder_path in stale:
+                print(f"  {display_name}")
+            print()
+
+        if dry_run:
+            if not quiet:
+                print("Dry run — no changes made.")
+            return 0
+
+        # 4. Remove stale directories
+        removed = 0
+        for display_name, folder_path in stale:
+            try:
+                shutil.rmtree(folder_path)
+                removed += 1
+                if verbose:
+                    print(f"  Removed: {display_name} ({folder_path})")
+            except OSError as e:
+                print(f"  ERROR removing {display_name}: {e}", file=sys.stderr)
+
+        if not quiet:
+            print(f"Removed {removed}/{len(stale)} stale folder(s).")
+
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        interrupted = True
+        try:
+            conn.shutdown()
+        except OSError:
+            pass
+        return 1
+    finally:
+        if not interrupted:
+            try:
+                conn.logout()
+            except (imaplib.IMAP4.error, OSError):
+                pass
+
+    return 0
+
+
 def imap_verify_and_delete(
     conn: imaplib.IMAP4_SSL,
     folder: str,
@@ -1797,6 +1893,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  %(prog)s --clean-hidden --imap-host HOST                   Clean hidden folders\n"
             "  %(prog)s --prune-noselect --imap-host HOST --dry-run       Report empty \\Noselect folders\n"
             "  %(prog)s --prune-noselect --imap-host HOST                 Prune empty \\Noselect folders\n"
+            "  %(prog)s --clean-local ~/Maildir --imap-host HOST --dry-run  Report stale local folders\n"
+            "  %(prog)s --clean-local ~/Maildir --imap-host HOST            Remove stale local folders\n"
         ),
     )
     parser.add_argument(
@@ -1860,10 +1958,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete empty \\Noselect hierarchy nodes (no messages transitively)",
     )
+    mode.add_argument(
+        "--clean-local",
+        action="store_true",
+        help="Remove local Maildir folders that no longer exist on the IMAP server",
+    )
     parser.add_argument(
         "-d", "--dry-run",
         action="store_true",
-        help="Preview without making changes (for --apply, --clean-hidden, --prune-noselect)",
+        help="Preview without making changes (for --apply, --clean-hidden, --prune-noselect, --clean-local)",
     )
     parser.add_argument(
         "--delete-folders",
@@ -1907,8 +2010,8 @@ def main() -> int:
     args = parser.parse_args()
 
     # --- Validation ---
-    if args.dry_run and not (args.apply or args.clean_hidden or args.prune_noselect):
-        print("ERROR: --dry-run requires --apply, --clean-hidden, or --prune-noselect",
+    if args.dry_run and not (args.apply or args.clean_hidden or args.prune_noselect or args.clean_local):
+        print("ERROR: --dry-run requires --apply, --clean-hidden, --prune-noselect, or --clean-local",
               file=sys.stderr)
         return 1
 
@@ -1920,8 +2023,10 @@ def main() -> int:
         print("ERROR: --delete-folders requires --clean-hidden", file=sys.stderr)
         return 1
 
-    if (args.clean_hidden or args.prune_noselect) and not args.imap_host:
-        mode_name = "--clean-hidden" if args.clean_hidden else "--prune-noselect"
+    if (args.clean_hidden or args.prune_noselect or args.clean_local) and not args.imap_host:
+        mode_name = ("--clean-hidden" if args.clean_hidden
+                     else "--prune-noselect" if args.prune_noselect
+                     else "--clean-local")
         print(f"ERROR: {mode_name} requires --imap-host", file=sys.stderr)
         return 1
 
@@ -1953,6 +2058,20 @@ def main() -> int:
     # --- Prune noselect mode ---
     if args.prune_noselect:
         return prune_noselect_folders(
+            imap_host=args.imap_host,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            quiet=args.quiet,
+        )
+
+    # --- Clean local folders mode ---
+    if args.clean_local:
+        maildir_root = Path(args.maildir_path).expanduser().resolve()
+        if not maildir_root.is_dir():
+            print(f"ERROR: {maildir_root} is not a directory", file=sys.stderr)
+            return 1
+        return clean_local_folders(
+            maildir_root=maildir_root,
             imap_host=args.imap_host,
             dry_run=args.dry_run,
             verbose=args.verbose,

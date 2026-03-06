@@ -2479,6 +2479,112 @@ class TestPruneNoselectFolders:
 
 
 # ---------------------------------------------------------------------------
+# clean_local_folders (orchestrator)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanLocalFolders:
+    def _make_maildir(self, tmp_path, folders):
+        """Create a Maildir with INBOX and given subfolder names."""
+        root = tmp_path / "Maildir"
+        # INBOX
+        (root / "cur").mkdir(parents=True)
+        (root / "new").mkdir(parents=True)
+        for name in folders:
+            d = root / f".{name}"
+            (d / "cur").mkdir(parents=True)
+            (d / "new").mkdir(parents=True)
+        return root
+
+    def _mock_conn(self, imap_folders):
+        """Create a mock IMAP connection listing the given folder names."""
+        conn = MagicMock()
+        entries = []
+        for name in imap_folders:
+            entries.append(f'(\\HasNoChildren) "/" "{name}"'.encode())
+        conn.list.return_value = ("OK", entries)
+        return conn
+
+    @patch("imap_dedup.imap_connect")
+    def test_no_stale_folders(self, mock_connect, tmp_path):
+        root = self._make_maildir(tmp_path, ["Sent", "Archive"])
+        conn = self._mock_conn(["INBOX", "Sent", "Archive"])
+        mock_connect.return_value = conn
+        rc = imap_dedup.clean_local_folders(root, "host", quiet=True)
+        assert rc == 0
+
+    @patch("imap_dedup.imap_connect")
+    def test_dry_run_reports_stale(self, mock_connect, tmp_path, capsys):
+        root = self._make_maildir(tmp_path, ["Sent", "OldFolder"])
+        conn = self._mock_conn(["INBOX", "Sent"])
+        mock_connect.return_value = conn
+        rc = imap_dedup.clean_local_folders(root, "host", dry_run=True)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "OldFolder" in out
+        # Directory should still exist
+        assert (root / ".OldFolder" / "cur").is_dir()
+
+    @patch("imap_dedup.imap_connect")
+    def test_removes_stale_folders(self, mock_connect, tmp_path):
+        root = self._make_maildir(tmp_path, ["Sent", "OldFolder"])
+        conn = self._mock_conn(["INBOX", "Sent"])
+        mock_connect.return_value = conn
+        rc = imap_dedup.clean_local_folders(root, "host", quiet=True)
+        assert rc == 0
+        assert not (root / ".OldFolder").exists()
+        assert (root / ".Sent" / "cur").is_dir()
+
+    @patch("imap_dedup.imap_connect")
+    def test_inbox_never_removed(self, mock_connect, tmp_path):
+        """INBOX is never removed even if missing from IMAP list."""
+        root = self._make_maildir(tmp_path, [])
+        # IMAP lists no folders at all
+        conn = self._mock_conn([])
+        mock_connect.return_value = conn
+        rc = imap_dedup.clean_local_folders(root, "host", quiet=True)
+        assert rc == 0
+        # INBOX (the root cur/new) still exists
+        assert (root / "cur").is_dir()
+
+    @patch("imap_dedup.imap_connect")
+    def test_keyboard_interrupt_returns_1(self, mock_connect):
+        conn = MagicMock()
+        conn.list.side_effect = KeyboardInterrupt
+        mock_connect.return_value = conn
+        rc = imap_dedup.clean_local_folders(Path("/tmp/fake"), "host", quiet=True)
+        assert rc == 1
+        conn.shutdown.assert_called_once()
+        conn.logout.assert_not_called()
+
+    @patch("imap_dedup.imap_connect")
+    def test_clean_local_requires_imap_host_via_cli(self, mock_connect):
+        with patch("sys.argv", ["prog", "--clean-local"]):
+            rc = imap_dedup.main()
+        assert rc == 1
+
+    @patch("imap_dedup.imap_connect")
+    def test_clean_local_requires_maildir(self, mock_connect):
+        """--clean-local with a nonexistent maildir path errors."""
+        with patch("sys.argv", ["prog", "--clean-local", "/nonexistent/path",
+                                 "--imap-host", "host"]):
+            rc = imap_dedup.main()
+        assert rc == 1
+
+    @patch("imap_dedup.imap_connect")
+    def test_hierarchical_folder_mapping(self, mock_connect, tmp_path):
+        """Local folder with dots maps to IMAP hierarchy with slashes."""
+        root = self._make_maildir(tmp_path, ["Work.Projects"])
+        # IMAP has Work/Projects (slash separator)
+        conn = self._mock_conn(["INBOX", "Work/Projects"])
+        mock_connect.return_value = conn
+        rc = imap_dedup.clean_local_folders(root, "host", quiet=True)
+        assert rc == 0
+        # Should NOT be removed since it maps to an existing IMAP folder
+        assert (root / ".Work.Projects" / "cur").is_dir()
+
+
+# ---------------------------------------------------------------------------
 # CLI validation for new modes
 # ---------------------------------------------------------------------------
 
@@ -2517,6 +2623,19 @@ class TestNewModeCLIValidation:
             rc = imap_dedup.main()
         assert rc == 0
         assert mock_fn.call_args[1]["delete_folders"] is True
+
+    def test_dry_run_with_clean_local_is_valid(self, tmp_path):
+        """--dry-run should be accepted with --clean-local."""
+        maildir = tmp_path / "Maildir"
+        (maildir / "cur").mkdir(parents=True)
+        (maildir / "new").mkdir(parents=True)
+        with patch("sys.argv", ["prog", "--clean-local", str(maildir),
+                                 "--imap-host", "host", "--dry-run"]), \
+             patch("imap_dedup.clean_local_folders", return_value=0) as mock_fn:
+            rc = imap_dedup.main()
+        assert rc == 0
+        mock_fn.assert_called_once()
+        assert mock_fn.call_args[1]["dry_run"] is True
 
     def test_dry_run_alone_fails(self):
         with patch("sys.argv", ["prog", "--dry-run"]):
