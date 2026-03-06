@@ -861,15 +861,30 @@ class TestImapConnect:
 
 
 class TestImapVerifyAndDelete:
-    def _make_fetch_response(self, message_id):
-        """Create realistic IMAP FETCH response."""
-        header = f"Message-ID: <{message_id}>\r\n\r\n".encode()
-        return [(b"1 (BODY[HEADER.FIELDS (MESSAGE-ID)] {35}", header), b")"]
+    def _make_fetch_response(self, uid_message_id_pairs):
+        """Create realistic batched IMAP FETCH response.
+
+        *uid_message_id_pairs* is either a single (uid, message_id) tuple /
+        a list of them, or just a message_id string (legacy shorthand with
+        uid=1).
+        """
+        if isinstance(uid_message_id_pairs, str):
+            uid_message_id_pairs = [(1, uid_message_id_pairs)]
+        elif isinstance(uid_message_id_pairs, tuple):
+            uid_message_id_pairs = [uid_message_id_pairs]
+        result: list = []
+        for uid, message_id in uid_message_id_pairs:
+            header = f"Message-ID: <{message_id}>\r\n\r\n".encode()
+            result.append(
+                (f"{uid} (UID {uid} BODY[HEADER.FIELDS (MESSAGE-ID)] {{35}}".encode(), header)
+            )
+            result.append(b")")
+        return result
 
     def test_verify_only(self):
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"1"])
-        conn.uid.return_value = ("OK", self._make_fetch_response("abc@ex.com"))
+        conn.uid.return_value = ("OK", self._make_fetch_response((42, "abc@ex.com")))
         entries = [{"uid": 42, "message_id": "abc@ex.com"}]
         verified, mismatched, deleted = imap_dedup.imap_verify_and_delete(
             conn, "INBOX", entries, delete=False,
@@ -885,7 +900,7 @@ class TestImapVerifyAndDelete:
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"1"])
         conn.uid.side_effect = [
-            ("OK", self._make_fetch_response("abc@ex.com")),  # FETCH
+            ("OK", self._make_fetch_response((42, "abc@ex.com"))),  # FETCH
             ("OK", None),  # STORE
         ]
         entries = [{"uid": 42, "message_id": "abc@ex.com"}]
@@ -899,7 +914,7 @@ class TestImapVerifyAndDelete:
     def test_message_id_mismatch(self):
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"1"])
-        conn.uid.return_value = ("OK", self._make_fetch_response("other@ex.com"))
+        conn.uid.return_value = ("OK", self._make_fetch_response((42, "other@ex.com")))
         entries = [{"uid": 42, "message_id": "abc@ex.com"}]
         verified, mismatched, deleted = imap_dedup.imap_verify_and_delete(
             conn, "INBOX", entries, delete=True,
@@ -910,6 +925,7 @@ class TestImapVerifyAndDelete:
     def test_uid_not_found(self):
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"1"])
+        # Server returns empty response for missing UIDs
         conn.uid.return_value = ("OK", [None])
         entries = [{"uid": 42, "message_id": "abc@ex.com"}]
         verified, mismatched, deleted = imap_dedup.imap_verify_and_delete(
@@ -933,7 +949,7 @@ class TestImapVerifyAndDelete:
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"1"])
         conn.uid.side_effect = [
-            ("OK", self._make_fetch_response("abc@ex.com")),  # FETCH
+            ("OK", self._make_fetch_response((42, "abc@ex.com"))),  # FETCH
             ("NO", None),  # STORE fails
         ]
         entries = [{"uid": 42, "message_id": "abc@ex.com"}]
@@ -946,10 +962,11 @@ class TestImapVerifyAndDelete:
     def test_mixed_results(self):
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"2"])
-        conn.uid.side_effect = [
-            ("OK", self._make_fetch_response("abc@ex.com")),  # FETCH match
-            ("OK", self._make_fetch_response("wrong@ex.com")),  # FETCH mismatch
-        ]
+        # Single batched FETCH returns both UIDs, one matches, one doesn't
+        conn.uid.return_value = ("OK", self._make_fetch_response([
+            (42, "abc@ex.com"),
+            (43, "wrong@ex.com"),
+        ]))
         entries = [
             {"uid": 42, "message_id": "abc@ex.com"},
             {"uid": 43, "message_id": "def@ex.com"},
@@ -963,9 +980,9 @@ class TestImapVerifyAndDelete:
     def test_bytes_header_parsing(self):
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"1"])
-        # Return raw bytes header
+        # Return raw bytes header with UID in envelope
         header = b"Message-ID: <bytes@test.com>\r\n\r\n"
-        conn.uid.return_value = ("OK", [(b"1 (BODY[HEADER.FIELDS (MESSAGE-ID)] {30}", header), b")"])
+        conn.uid.return_value = ("OK", [(b"1 (UID 1 BODY[HEADER.FIELDS (MESSAGE-ID)] {30}", header), b")"])
         entries = [{"uid": 1, "message_id": "bytes@test.com"}]
         verified, _, _ = imap_dedup.imap_verify_and_delete(
             conn, "INBOX", entries, delete=False,
@@ -978,7 +995,7 @@ class TestImapVerifyAndDelete:
         conn.select.return_value = ("OK", [b"1"])
         # Folded header: value on continuation line
         header = b"Message-ID:\r\n    <very-long-id@example.com>\r\n\r\n"
-        conn.uid.return_value = ("OK", [(b"1 (BODY[HEADER.FIELDS (MESSAGE-ID)] {50}", header), b")"])
+        conn.uid.return_value = ("OK", [(b"1 (UID 1 BODY[HEADER.FIELDS (MESSAGE-ID)] {50}", header), b")"])
         entries = [{"uid": 1, "message_id": "very-long-id@example.com"}]
         verified, mismatched, _ = imap_dedup.imap_verify_and_delete(
             conn, "INBOX", entries, delete=False,
@@ -991,7 +1008,7 @@ class TestImapVerifyAndDelete:
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"1"])
         header = b"Message-ID:\r\n\t<tabbed-id@example.com>\r\n\r\n"
-        conn.uid.return_value = ("OK", [(b"1 (BODY[HEADER.FIELDS (MESSAGE-ID)] {45}", header), b")"])
+        conn.uid.return_value = ("OK", [(b"1 (UID 1 BODY[HEADER.FIELDS (MESSAGE-ID)] {45}", header), b")"])
         entries = [{"uid": 1, "message_id": "tabbed-id@example.com"}]
         verified, mismatched, _ = imap_dedup.imap_verify_and_delete(
             conn, "INBOX", entries, delete=False,
@@ -1004,7 +1021,7 @@ class TestImapVerifyAndDelete:
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"1"])
         conn.uid.side_effect = [
-            ("OK", self._make_fetch_response("abc@ex.com")),  # FETCH
+            ("OK", self._make_fetch_response((42, "abc@ex.com"))),  # FETCH
             ("OK", None),  # MOVE
         ]
         entries = [{"uid": 42, "message_id": "abc@ex.com"}]
@@ -1025,7 +1042,7 @@ class TestImapVerifyAndDelete:
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"1"])
         conn.uid.side_effect = [
-            ("OK", self._make_fetch_response("abc@ex.com")),  # FETCH
+            ("OK", self._make_fetch_response((42, "abc@ex.com"))),  # FETCH
             ("OK", None),  # STORE
         ]
         entries = [{"uid": 42, "message_id": "abc@ex.com"}]
@@ -1039,9 +1056,10 @@ class TestImapVerifyAndDelete:
         conn.expunge.assert_called_once()
 
     def test_short_tuple_in_fetch_response(self):
-        """A tuple with length < 2 should count as mismatch, not IndexError."""
+        """A tuple with length < 2 should count as mismatch (UID not found)."""
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"1"])
+        # Short tuple without header data — UID won't be extracted
         conn.uid.return_value = ("OK", [(b"1 (FLAGS (\\Seen))",)])
         entries = [{"uid": 42, "message_id": "abc@ex.com"}]
         verified, mismatched, deleted = imap_dedup.imap_verify_and_delete(
@@ -1055,7 +1073,7 @@ class TestImapVerifyAndDelete:
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"1"])
         conn.uid.side_effect = [
-            ("OK", self._make_fetch_response("abc@ex.com")),  # FETCH
+            ("OK", self._make_fetch_response((42, "abc@ex.com"))),  # FETCH
             ("NO", None),  # MOVE fails
         ]
         entries = [{"uid": 42, "message_id": "abc@ex.com"}]
@@ -1067,7 +1085,7 @@ class TestImapVerifyAndDelete:
         assert deleted == 0
 
     def test_batched_delete(self):
-        """Permanent delete batches STORE calls and calls EXPUNGE once."""
+        """Permanent delete batches both FETCH and STORE calls."""
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"1200"])
         num_entries = 1200
@@ -1075,11 +1093,15 @@ class TestImapVerifyAndDelete:
             {"uid": i, "message_id": f"msg{i}@ex.com"}
             for i in range(1, num_entries + 1)
         ]
+        # 3 batched FETCH responses (500+500+200)
         fetch_responses = [
-            ("OK", self._make_fetch_response(f"msg{i}@ex.com"))
-            for i in range(1, num_entries + 1)
+            ("OK", self._make_fetch_response([
+                (i, f"msg{i}@ex.com")
+                for i in range(start, min(start + 500, num_entries + 1))
+            ]))
+            for start in range(1, num_entries + 1, 500)
         ]
-        store_responses = [("OK", None)] * 3  # 3 batches: 500+500+200
+        store_responses = [("OK", None)] * 3  # 3 batched STORE calls
         conn.uid.side_effect = fetch_responses + store_responses
 
         verified, mismatched, deleted = imap_dedup.imap_verify_and_delete(
@@ -1089,12 +1111,14 @@ class TestImapVerifyAndDelete:
         assert verified == 1200
         assert mismatched == 0
         assert deleted == 1200
+        fetch_calls = [c for c in conn.uid.call_args_list if c[0][0] == "FETCH"]
+        assert len(fetch_calls) == 3
         store_calls = [c for c in conn.uid.call_args_list if c[0][0] == "STORE"]
         assert len(store_calls) == 3
         conn.expunge.assert_called_once()
 
     def test_batched_move(self):
-        """Non-permanent delete batches MOVE calls."""
+        """Non-permanent delete batches both FETCH and MOVE calls."""
         conn = MagicMock()
         conn.select.return_value = ("OK", [b"1200"])
         num_entries = 1200
@@ -1102,11 +1126,15 @@ class TestImapVerifyAndDelete:
             {"uid": i, "message_id": f"msg{i}@ex.com"}
             for i in range(1, num_entries + 1)
         ]
+        # 3 batched FETCH responses (500+500+200)
         fetch_responses = [
-            ("OK", self._make_fetch_response(f"msg{i}@ex.com"))
-            for i in range(1, num_entries + 1)
+            ("OK", self._make_fetch_response([
+                (i, f"msg{i}@ex.com")
+                for i in range(start, min(start + 500, num_entries + 1))
+            ]))
+            for start in range(1, num_entries + 1, 500)
         ]
-        move_responses = [("OK", None)] * 3  # 3 batches: 500+500+200
+        move_responses = [("OK", None)] * 3  # 3 batched MOVE calls
         conn.uid.side_effect = fetch_responses + move_responses
 
         verified, mismatched, deleted = imap_dedup.imap_verify_and_delete(
@@ -1116,6 +1144,8 @@ class TestImapVerifyAndDelete:
         assert verified == 1200
         assert mismatched == 0
         assert deleted == 1200
+        fetch_calls = [c for c in conn.uid.call_args_list if c[0][0] == "FETCH"]
+        assert len(fetch_calls) == 3
         move_calls = [c for c in conn.uid.call_args_list if c[0][0] == "MOVE"]
         assert len(move_calls) == 3
         conn.expunge.assert_not_called()
@@ -1312,7 +1342,7 @@ class TestApplyPlan:
         mock_connect.return_value = mock_conn
         mock_conn.select.return_value = ("OK", [b"1"])
         mock_conn.uid.return_value = ("OK", [
-            (b"1 (BODY[HEADER.FIELDS (MESSAGE-ID)] {30}", b"Message-ID: <a@b.com>\r\n\r\n"),
+            (b"2 (UID 2 BODY[HEADER.FIELDS (MESSAGE-ID)] {30}", b"Message-ID: <a@b.com>\r\n\r\n"),
             b")",
         ])
         f = tmp_path / "plan.json"
@@ -1332,7 +1362,7 @@ class TestApplyPlan:
         mock_connect.return_value = mock_conn
         mock_conn.select.return_value = ("OK", [b"1"])
         mock_conn.uid.return_value = ("OK", [
-            (b"1 (BODY[HEADER.FIELDS (MESSAGE-ID)] {30}", b"Message-ID: <a@b.com>\r\n\r\n"),
+            (b"2 (UID 2 BODY[HEADER.FIELDS (MESSAGE-ID)] {30}", b"Message-ID: <a@b.com>\r\n\r\n"),
             b")",
         ])
         f = tmp_path / "plan.json"
@@ -1359,7 +1389,7 @@ class TestApplyPlan:
         mock_connect.return_value = mock_conn
         mock_conn.select.return_value = ("OK", [b"1"])
         mock_conn.uid.return_value = ("OK", [
-            (b"1 (BODY[HEADER.FIELDS (MESSAGE-ID)] {30}", b"Message-ID: <a@b.com>\r\n\r\n"),
+            (b"2 (UID 2 BODY[HEADER.FIELDS (MESSAGE-ID)] {30}", b"Message-ID: <a@b.com>\r\n\r\n"),
             b")",
         ])
         f = tmp_path / "plan.json"
@@ -1378,7 +1408,7 @@ class TestApplyPlan:
         mock_connect.return_value = mock_conn
         mock_conn.select.return_value = ("OK", [b"1"])
         mock_conn.uid.return_value = ("OK", [
-            (b"1 (BODY[HEADER.FIELDS (MESSAGE-ID)] {30}", b"Message-ID: <wrong@b.com>\r\n\r\n"),
+            (b"2 (UID 2 BODY[HEADER.FIELDS (MESSAGE-ID)] {30}", b"Message-ID: <wrong@b.com>\r\n\r\n"),
             b")",
         ])
         f = tmp_path / "plan.json"

@@ -1405,46 +1405,75 @@ def imap_verify_and_delete(
     mismatched = 0
     uids_to_delete: list[str] = []
     hdr_parser = email.parser.BytesHeaderParser(policy=email.policy.compat32)
+    uid_re = re.compile(rb"UID (\d+)")
 
+    # Build lookup: uid_str -> entry
+    uid_to_entry: dict[str, dict] = {}
     for entry in entries:
-        uid = str(entry["uid"])
-        expected_mid = entry["message_id"]
+        uid_to_entry[str(entry["uid"])] = entry
 
-        typ, data = conn.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
-        if typ != "OK" or not data or data[0] is None:
-            if verbose:
-                print(f"    UID {uid}: not found on server (already deleted?)")
-            mismatched += 1
-            continue
+    all_uids = list(uid_to_entry.keys())
+    total_batches = (len(all_uids) + batch_size - 1) // batch_size
 
-        # Parse the fetched header (using BytesHeaderParser to handle folded headers)
-        if isinstance(data[0], tuple) and len(data[0]) >= 2:
-            raw_header = data[0][1]
-        elif isinstance(data[0], tuple):
-            mismatched += 1
-            continue
-        else:
-            raw_header = data[0]
-        if isinstance(raw_header, str):
-            raw_header = raw_header.encode("utf-8", errors="replace")
+    for batch_idx in range(0, len(all_uids), batch_size):
+        batch_uids = all_uids[batch_idx : batch_idx + batch_size]
+        uid_set = ",".join(batch_uids)
+        batch_num = batch_idx // batch_size + 1
 
-        parsed = hdr_parser.parsebytes(raw_header)
-        mid_value = parsed.get("Message-ID")
-        fetched_mid = normalize_message_id(mid_value) if mid_value else ""
+        if not quiet and total_batches > 1:
+            print(f"    Verifying batch {batch_num}/{total_batches} ({len(batch_uids)} messages)...")
 
-        if fetched_mid == expected_mid:
-            verified += 1
-            if delete:
-                uids_to_delete.append(uid)
-            if verbose:
-                subj = entry.get("subject", "")
-                print(f"    UID {uid}: verified ✓  {subj[:60]}")
-        else:
-            mismatched += 1
-            if verbose:
-                print(f"    UID {uid}: Message-ID mismatch!")
-                print(f"      Expected: {expected_mid}")
-                print(f"      Got:      {fetched_mid}")
+        typ, data = conn.uid("FETCH", uid_set, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+
+        # Track which UIDs we got responses for
+        found_uids: set[str] = set()
+
+        if typ == "OK" and data:
+            # Parse multi-message response: data is a flat list where each
+            # message is a (envelope_bytes, header_bytes) tuple followed by b")"
+            for item in data:
+                if not isinstance(item, tuple) or len(item) < 2:
+                    continue
+                envelope, raw_header = item[0], item[1]
+                # Extract UID from envelope line
+                m = uid_re.search(envelope)
+                if not m:
+                    continue
+                uid_str = m.group(1).decode()
+                if uid_str not in uid_to_entry:
+                    continue
+                found_uids.add(uid_str)
+
+                if isinstance(raw_header, str):
+                    raw_header = raw_header.encode("utf-8", errors="replace")
+
+                parsed = hdr_parser.parsebytes(raw_header)
+                mid_value = parsed.get("Message-ID")
+                fetched_mid = normalize_message_id(mid_value) if mid_value else ""
+
+                entry = uid_to_entry[uid_str]
+                expected_mid = entry["message_id"]
+
+                if fetched_mid == expected_mid:
+                    verified += 1
+                    if delete:
+                        uids_to_delete.append(uid_str)
+                    if verbose:
+                        subj = entry.get("subject", "")
+                        print(f"    UID {uid_str}: verified ✓  {subj[:60]}")
+                else:
+                    mismatched += 1
+                    if verbose:
+                        print(f"    UID {uid_str}: Message-ID mismatch!")
+                        print(f"      Expected: {expected_mid}")
+                        print(f"      Got:      {fetched_mid}")
+
+        # UIDs not found in response count as mismatched (already deleted)
+        for uid_str in batch_uids:
+            if uid_str not in found_uids:
+                mismatched += 1
+                if verbose:
+                    print(f"    UID {uid_str}: not found on server (already deleted?)")
 
     deleted = 0
     if uids_to_delete:
