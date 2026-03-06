@@ -1421,7 +1421,8 @@ def imap_verify_and_delete(
         batch_num = batch_idx // batch_size + 1
 
         if not quiet and total_batches > 1:
-            print(f"    Verifying batch {batch_num}/{total_batches} ({len(batch_uids)} messages)...")
+            if batch_num == 1 or batch_num == total_batches or batch_num % 50 == 0:
+                print(f"    Verifying batch {batch_num}/{total_batches}...")
 
         typ, data = conn.uid("FETCH", uid_set, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
 
